@@ -2203,7 +2203,8 @@ class CommandRunnerTab(ttk.Frame):
 
         # ---- Scope ----
         scope = ttk.LabelFrame(left, text="Scope", padding=8)
-        scope.grid(row=0, column=0, sticky="ew")
+        scope.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        scope.rowconfigure(5, weight=1)
         self.scope_var = tk.StringVar(value="site")
 
         self.scope_radio_site = ttk.Radiobutton(
@@ -2234,13 +2235,14 @@ class CommandRunnerTab(ttk.Frame):
         self.clear_link.bind("<Button-1>", lambda e: self._set_all_checked(False))
 
         check_outer = ttk.Frame(scope)
-        check_outer.grid(row=5, column=0, sticky="ew", padx=(18, 0))
+        check_outer.grid(row=5, column=0, sticky="nsew", padx=(18, 0))
         check_outer.columnconfigure(0, weight=1)
-        self._check_canvas = tk.Canvas(check_outer, width=230, height=170, highlightthickness=1,
+        check_outer.rowconfigure(0, weight=1)
+        self._check_canvas = tk.Canvas(check_outer, width=230, height=260, highlightthickness=1,
                                        highlightbackground="#8a8a8a", background="#ffffff")
         check_scroll = ttk.Scrollbar(check_outer, orient="vertical", command=self._check_canvas.yview)
         self._check_canvas.configure(yscrollcommand=check_scroll.set)
-        self._check_canvas.grid(row=0, column=0, sticky="ew")
+        self._check_canvas.grid(row=0, column=0, sticky="nsew")
         check_scroll.grid(row=0, column=1, sticky="ns")
         self._check_inner = ttk.Frame(self._check_canvas)
         self._check_window = self._check_canvas.create_window((0, 0), window=self._check_inner, anchor="nw")
@@ -2262,11 +2264,11 @@ class CommandRunnerTab(ttk.Frame):
 
         # ---- Plugin list ----
         plugin_box = ttk.LabelFrame(left, text="Plugins", padding=4)
-        plugin_box.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        plugin_box.grid(row=0, column=0, sticky="ew")
         plugin_box.rowconfigure(0, weight=1)
         plugin_box.columnconfigure(0, weight=1)
         self.plugin_list = tk.Listbox(
-            plugin_box, exportselection=False, activestyle="none", height=8, borderwidth=0,
+            plugin_box, exportselection=False, activestyle="none", height=4, borderwidth=0,
             highlightthickness=0, selectbackground="#1f4e8c", selectforeground="#ffffff",
             font=("Segoe UI", 10))
         self.plugin_list.grid(row=0, column=0, sticky="nsew")
