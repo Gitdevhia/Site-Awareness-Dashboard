@@ -21,5 +21,10 @@
     "interface_down_health": "critical",
     "unreachable_pairs_warn": false,
     "data_stale_after_days": 2
+  },
+
+  "command_runner": {
+    "max_workers": 24,
+    "per_site_limit": 5
   }
 }

@@ -29,6 +29,10 @@ DEFAULTS = {
         "unreachable_pairs_warn": False,
         "data_stale_after_days": 2,
     },
+    "command_runner": {
+        "max_workers": 24,
+        "per_site_limit": 5,
+    },
 }
 
 _cache = {"stamp": "unset", "data": {}}

@@ -1361,6 +1361,11 @@ def _load_creds_or_exit() -> dict:
 PLUGINS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "utilities", "plugins")
 LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
+# Command-runner concurrency defaults (the GUI reads settings.json
+# "command_runner" and passes its values in; these are the fallbacks).
+PLUGIN_MAX_WORKERS = 24
+PLUGIN_PER_SITE_LIMIT = 5
+
 
 def list_plugins() -> dict:
     """Scans utilities/plugins/ for command-runner plugins and returns
@@ -1412,21 +1417,38 @@ def is_standalone_plugin(module) -> bool:
     return hasattr(module, "run")
 
 
-def _devices_in_scope(conn, site_id):
-    """Every device to run a plugin against - one site if site_id is
-    given, every site if it's None. Reuses SAD's own device records
-    directly (hostname, platform, ranked IPs) rather than needing a
-    separately-maintained device list the way the original standalone
-    script's CSV input did.
+def _site_groups_in_scope(conn, site_ids) -> list:
+    """[(site_row, [device rows])] for the chosen scope, in site order.
+
+    site_ids may be None (every site), a single site id, or a list/tuple/
+    set of site ids (the GUI's "Selected sites"). Duplicates are dropped
+    and unknown ids are ignored rather than raising, so a site deleted
+    between a preview and a commit simply falls out of scope.
     """
-    if site_id is None:
+    if site_ids is None:
         sites = db.get_all_sites(conn)
     else:
-        site = db.get_site_by_id(conn, site_id)
-        sites = [site] if site else []
+        if isinstance(site_ids, (list, tuple, set, frozenset)):
+            wanted = list(dict.fromkeys(site_ids))
+        else:
+            wanted = [site_ids]
+        sites = []
+        for sid in wanted:
+            site = db.get_site_by_id(conn, sid)
+            if site:
+                sites.append(site)
+    return [(site, list(db.get_devices_for_site(conn, site["id"]))) for site in sites]
+
+
+def _devices_in_scope(conn, site_ids):
+    """Every device to run a plugin against, flattened. Reuses SAD's own
+    device records directly (hostname, platform, ranked IPs) rather than
+    needing a separately-maintained device list the way the original
+    standalone script's CSV input did.
+    """
     devices = []
-    for site in sites:
-        devices.extend(db.get_devices_for_site(conn, site["id"]))
+    for _site, site_devices in _site_groups_in_scope(conn, site_ids):
+        devices.extend(site_devices)
     return devices
 
 
@@ -1437,10 +1459,37 @@ def _save_device_config(conn, device_type) -> None:
         conn.save_config()
 
 
+def _interleave_by_site(jobs_by_site: list) -> list:
+    """Round-robin across sites: device 1 of every site, then device 2 of
+    every site, and so on. Jobs submitted site-by-site would let workers
+    pile onto a site that is already at its per-site limit and sit
+    blocked on its semaphore, wasting pool slots; interleaving makes that
+    almost never happen.
+    """
+    ordered = []
+    depth = max((len(j) for j in jobs_by_site), default=0)
+    for i in range(depth):
+        for site_jobs in jobs_by_site:
+            if i < len(site_jobs):
+                ordered.append(site_jobs[i])
+    return ordered
+
+
 def run_plugin(conn, plugin_module, params: dict, site_id, username: str, password: str,
                secret: str = None, commit: bool = False, save: bool = False,
-               connect_fn=None) -> list:
-    """Runs a command-runner plugin against every device in scope.
+               connect_fn=None, max_workers: int = PLUGIN_MAX_WORKERS,
+               per_site_limit: int = PLUGIN_PER_SITE_LIMIT,
+               progress_cb=None, stop_event=None) -> list:
+    """Runs a command-runner plugin against every device in scope, with
+    devices worked in parallel.
+
+    site_id: None = every site, an int = one site, a list of ints = those
+    sites. (Parameter name kept for older callers.)
+
+    Threading: one pool of max_workers threads over devices, with at most
+    per_site_limit devices of any one site in flight at once. A plugin can
+    narrow this with optional module attributes: PARALLEL = False runs one
+    device at a time, MAX_WORKERS = N caps the pool for that plugin.
 
     ALWAYS calls plugin_module.plan() first, regardless of commit -
     plan() is read-only by contract, so this is exactly as safe to
@@ -1453,18 +1502,40 @@ def run_plugin(conn, plugin_module, params: dict, site_id, username: str, passwo
     device. Every device's plan, and the outcome of applying it, is
     written to a persistent, timestamped audit log file under logs/,
     in addition to being returned for the caller (the GUI) to display.
+    Each device's lines are buffered and written as one block when that
+    device finishes, so concurrent devices never interleave in the log.
+
+    progress_cb(done_devices, total_devices, done_sites, total_sites) is
+    called from worker threads after each device finishes (a queue.put
+    is a safe callback). stop_event (a threading.Event): once set, devices
+    not yet started are skipped; devices already running finish normally.
+
+    Results are returned in site/device order, not completion order.
 
     connect_fn defaults to the real _connect() (live Netmiko); tests
     pass a fake with the same (host, username, password, platform_hint,
     secret) -> connection-like object signature, matching every other
     connect_fn override already used elsewhere in this file.
     """
-    devices = _devices_in_scope(conn, site_id)
+    groups = _site_groups_in_scope(conn, site_id)
+    total_devices = sum(len(ds) for _s, ds in groups)
     os.makedirs(LOGS_DIR, exist_ok=True)
     safe_name = re.sub(r"[^\w.-]", "_", plugin_module.NAME)
     log_path = os.path.join(
         LOGS_DIR, f"command_runner_{safe_name}_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
     )
+
+    # Effective concurrency: the caller's numbers, narrowed by anything
+    # the plugin itself declares.
+    workers = max(1, int(max_workers))
+    site_cap = max(1, int(per_site_limit))
+    plugin_cap = getattr(plugin_module, "MAX_WORKERS", None)
+    if isinstance(plugin_cap, int) and plugin_cap > 0:
+        workers = min(workers, plugin_cap)
+    if getattr(plugin_module, "PARALLEL", True) is False:
+        workers = 1
+    workers = max(1, min(workers, total_devices or 1))
+
     # Independent connection, not the caller's - same reasoning as
     # discovery_run above: this fires before the actual per-device
     # work, which is exactly the situation where sharing a connection
@@ -1472,86 +1543,168 @@ def run_plugin(conn, plugin_module, params: dict, site_id, username: str, passwo
     # raises before the caller's own transaction ever commits.
     db.log_activity(
         "command_runner_run",
-        f"{plugin_module.NAME} - {'COMMIT' if commit else 'DRY-RUN'} - {len(devices)} device(s) in scope",
+        f"{plugin_module.NAME} - {'COMMIT' if commit else 'DRY-RUN'} - {total_devices} device(s) in "
+        f"{len(groups)} site(s), {workers} worker(s), {site_cap} per site",
         detail_ref=log_path,
     )
 
-    results = []
+    # All DB reads happen here on the calling thread - the sqlite
+    # connection is not shared with workers.
+    jobs_by_site = []
+    results = [None] * total_devices
+    index = 0
+    for site, site_devices in groups:
+        site_jobs = []
+        for device in site_devices:
+            site_jobs.append({
+                "index": index, "site_id": site["id"],
+                "site_label": str(site["site_name"] or site["site_octet"]),
+                "device": device,
+                "ips": list(db.get_ips_for_device(conn, device["id"])),
+            })
+            index += 1
+        if site_jobs:
+            jobs_by_site.append(site_jobs)
+    jobs = _interleave_by_site(jobs_by_site)
+
+    sites_total = len(jobs_by_site)
+    remaining_in_site = {sj[0]["site_id"]: len(sj) for sj in jobs_by_site}
+    site_slots = {sid: threading.BoundedSemaphore(site_cap) for sid in remaining_in_site}
+    state = {"done_devices": 0, "done_sites": 0}
+    lock = threading.Lock()
     connector = connect_fn or _connect
 
     with open(log_path, "w", encoding="utf-8") as logf:
-        def log(line: str = "") -> None:
-            stamped = f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {line}" if line else ""
-            print(stamped)
-            logf.write(stamped + "\n")
+        def emit(lines: list) -> None:
+            block = "\n".join(lines)
+            print(block)
+            logf.write(block + "\n")
             logf.flush()
 
-        log(f"=== {plugin_module.NAME} - {'COMMIT' if commit else 'DRY-RUN'} - {len(devices)} device(s) in scope ===")
-        log(f"Parameters: {params}")
-        log()
+        def stamp(line: str = "") -> str:
+            return f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {line}" if line else ""
 
-        for device in devices:
+        with lock:
+            emit([
+                stamp(f"=== {plugin_module.NAME} - {'COMMIT' if commit else 'DRY-RUN'} - "
+                      f"{total_devices} device(s) in {sites_total} site(s) ==="),
+                stamp(f"Parameters: {params}"),
+                stamp(f"Concurrency: {workers} worker(s), at most {site_cap} per site"),
+                "",
+            ])
+
+        def finish(job, result, lines):
+            lines.append("")
+            with lock:
+                emit(lines)
+                results[job["index"]] = result
+                state["done_devices"] += 1
+                remaining_in_site[job["site_id"]] -= 1
+                if remaining_in_site[job["site_id"]] == 0:
+                    state["done_sites"] += 1
+                snapshot = (state["done_devices"], total_devices, state["done_sites"], sites_total)
+            if progress_cb is not None:
+                try:
+                    progress_cb(*snapshot)
+                except Exception:
+                    pass
+
+        def work(job):
+            device = job["device"]
             hostname = device["hostname"]
-            result = {"hostname": hostname, "changes": [], "error": None, "applied": False}
-            log(f"--- {hostname} ---")
+            result = {"hostname": hostname, "site_id": job["site_id"], "changes": [],
+                      "error": None, "applied": False, "skipped": False}
+            lines = [stamp(f"--- {job['site_label']} / {hostname} ---")]
 
-            ip_candidates = db.get_ips_for_device(conn, device["id"])
-            if not ip_candidates:
-                result["error"] = "No known IP on file for this device"
-                log(f"  SKIPPED: {result['error']}")
-                results.append(result)
-                log()
-                continue
+            def log(line: str = "") -> None:
+                lines.append(stamp(line))
 
-            netmiko_conn = None
             try:
-                last_exc = None
-                for ip in ip_candidates:
+                if stop_event is not None and stop_event.is_set():
+                    result["error"] = "Skipped (stopped before this device started)"
+                    result["skipped"] = True
+                    log(f"  SKIPPED: {result['error']}")
+                    return finish(job, result, lines)
+
+                with site_slots[job["site_id"]]:
+                    if stop_event is not None and stop_event.is_set():
+                        result["error"] = "Skipped (stopped before this device started)"
+                        result["skipped"] = True
+                        log(f"  SKIPPED: {result['error']}")
+                        return finish(job, result, lines)
+
+                    if not job["ips"]:
+                        result["error"] = "No known IP on file for this device"
+                        log(f"  SKIPPED: {result['error']}")
+                        return finish(job, result, lines)
+
+                    netmiko_conn = None
                     try:
-                        netmiko_conn = connector(ip, username, password, platform_hint=device["platform"], secret=secret)
-                        break
+                        last_exc = None
+                        for ip in job["ips"]:
+                            try:
+                                netmiko_conn = connector(ip, username, password,
+                                                         platform_hint=device["platform"], secret=secret)
+                                break
+                            except Exception as e:
+                                last_exc = e
+                                netmiko_conn = None
+                        if netmiko_conn is None:
+                            raise last_exc or ConnectionError("No usable IP for this device")
+
+                        changes = plugin_module.plan(netmiko_conn, device, params)
+                        result["changes"] = changes
+
+                        if not changes:
+                            log("  No changes needed.")
+                        else:
+                            prefix = "" if commit else "[DRY-RUN] "
+                            for change in changes:
+                                log(f"  {prefix}{change['description']}")
+                                for cmd in change["commands"]:
+                                    log(f"    > {cmd}")
+
+                            if commit:
+                                for change in changes:
+                                    netmiko_conn.send_config_set(change["commands"])
+                                result["applied"] = True
+                                log(f"  Applied {len(changes)} change(s).")
+                                if save:
+                                    _save_device_config(netmiko_conn, _guess_device_type(device["platform"]))
+                                    log("  Config saved.")
                     except Exception as e:
-                        last_exc = e
-                        netmiko_conn = None
-                if netmiko_conn is None:
-                    raise last_exc or ConnectionError("No usable IP for this device")
-
-                changes = plugin_module.plan(netmiko_conn, device, params)
-                result["changes"] = changes
-
-                if not changes:
-                    log("  No changes needed.")
-                else:
-                    prefix = "" if commit else "[DRY-RUN] "
-                    for change in changes:
-                        log(f"  {prefix}{change['description']}")
-                        for cmd in change["commands"]:
-                            log(f"    > {cmd}")
-
-                    if commit:
-                        for change in changes:
-                            netmiko_conn.send_config_set(change["commands"])
-                        result["applied"] = True
-                        log(f"  Applied {len(changes)} change(s).")
-                        if save:
-                            _save_device_config(netmiko_conn, _guess_device_type(device["platform"]))
-                            log("  Config saved.")
-
-            except Exception as e:
+                        result["error"] = str(e)
+                        log(f"  ERROR: {result['error']}")
+                    finally:
+                        if netmiko_conn is not None:
+                            try:
+                                netmiko_conn.disconnect()
+                            except Exception:
+                                pass
+                return finish(job, result, lines)
+            except Exception as e:  # never let a worker raise out of the pool
                 result["error"] = str(e)
-                log(f"  ERROR: {result['error']}")
-            finally:
-                if netmiko_conn is not None:
-                    try:
-                        netmiko_conn.disconnect()
-                    except Exception:
-                        pass
+                lines.append(stamp(f"  ERROR: {e}"))
+                return finish(job, result, lines)
 
-            results.append(result)
-            log()
+        if jobs:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for future in [pool.submit(work, job) for job in jobs]:
+                    future.result()
+
+        done = [r for r in results if r is not None]
+        with_changes = sum(1 for r in done if r["changes"])
+        applied = sum(1 for r in done if r["applied"])
+        errors = sum(1 for r in done if r["error"] and not r["skipped"])
+        skipped = sum(1 for r in done if r["skipped"])
+        with lock:
+            emit([stamp(
+                f"=== Finished: {len(done)} device(s), {with_changes} with changes"
+                f"{f', {applied} applied' if commit else ''}, {errors} error(s), {skipped} skipped ==="
+            )])
 
     print(f"Audit log written to {log_path}")
-    return results
+    return [r for r in results if r is not None]
 
 
 def run_standalone_plugin(plugin_module, params: dict, username: str, password: str,

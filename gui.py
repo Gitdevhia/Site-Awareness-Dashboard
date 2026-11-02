@@ -53,6 +53,7 @@ import gemone_tab  # noqa: E402
 import config_viewer  # noqa: E402
 import csv_export  # noqa: E402
 import write_queue  # noqa: E402
+import settings_loader  # noqa: E402
 
 
 CLEAR = object()  # sentinel: "the user chose to clear/reset", distinct from None (cancelled)
@@ -2137,104 +2138,237 @@ class CommandRunnerTab(ttk.Frame):
     """GUI over orchestrator.run_plugin() - SAD's first write-capable
     feature. The central safety mechanism: Commit is disabled until a
     Preview (always dry-run) has been run for the EXACT current scope/
-    plugin/parameter combination - any change to any of those after a
-    preview immediately disables Commit again, forcing a fresh preview
-    before anything can actually be pushed. Preview and Commit are
+    plugin/parameter/concurrency combination - any change to any of those
+    after a preview immediately disables Commit again, forcing a fresh
+    preview before anything can actually be pushed. Preview and Commit are
     deliberately two separate, distinctly-labeled buttons rather than
     one Run button plus a commit checkbox, which would be too easy to
     leave checked between unrelated runs.
+
+    Layout: left column = Scope (one site / all sites / selected sites)
+    over the plugin list; right column = the chosen plugin's description
+    and parameters, run options, buttons, progress and the console.
+    Devices run in parallel (see orchestrator.run_plugin): one worker
+    pool, with a cap on how many devices of one site run at once.
     """
 
     def __init__(self, parent, creds):
         super().__init__(parent)
         self._creds = creds
         self._worker_thread = None
+        self._stop_event = None
         self._output_queue = queue.Queue()
-        self._site_keys = []
+        self._site_keys = []          # site ids, same order as the combobox
+        self._site_info = []          # [{"id", "label", "devices"}] in site order
+        self._site_vars = {}          # site id -> BooleanVar (Selected sites checklist)
+        self._site_rows = {}          # site id -> Checkbutton widget
         self._param_vars = {}
         self._last_previewed_signature = None
         self._pending_completion = None
         self._plugins = orchestrator.list_plugins()
         self._plugin_ids = sorted(self._plugins)
+        try:
+            cfg = settings_loader.get_section("command_runner")
+        except Exception:
+            cfg = {}
+        self._default_workers = self._as_int(cfg.get("max_workers"), orchestrator.PLUGIN_MAX_WORKERS)
+        self._default_per_site = self._as_int(cfg.get("per_site_limit"), orchestrator.PLUGIN_PER_SITE_LIMIT)
         self._build_layout()
         self._poll_queue()
         self._refresh_site_choices()
+        self.bind("<Map>", lambda e: self._on_tab_shown())
 
+    @staticmethod
+    def _as_int(value, fallback):
+        try:
+            n = int(value)
+            return n if n > 0 else fallback
+        except (TypeError, ValueError):
+            return fallback
+
+    # ------------------------------------------------------------------
+    # Layout
+    # ------------------------------------------------------------------
     def _build_layout(self):
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=1)
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
 
-        controls = ttk.Frame(self, padding=10)
-        controls.grid(row=0, column=0, sticky="ew")
+        left = ttk.Frame(self, padding=(10, 10, 5, 10))
+        left.grid(row=0, column=0, sticky="ns")
+        left.rowconfigure(1, weight=1)
+        right = ttk.Frame(self, padding=(5, 10, 10, 10))
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(5, weight=1)
 
-        ttk.Label(controls, text="Scope").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        # ---- Scope ----
+        scope = ttk.LabelFrame(left, text="Scope", padding=8)
+        scope.grid(row=0, column=0, sticky="ew")
         self.scope_var = tk.StringVar(value="site")
-        scope_radio_site = ttk.Radiobutton(
-            controls, text="One site:", variable=self.scope_var, value="site",
-            command=self._invalidate_preview,
-        )
-        scope_radio_site.grid(row=0, column=1, sticky="w")
-        self.site_combo = ttk.Combobox(controls, state="readonly", width=28)
-        self.site_combo.grid(row=0, column=2, sticky="w", padx=(4, 20))
-        self.site_combo.bind("<<ComboboxSelected>>", lambda e: self._invalidate_preview())
-        scope_radio_all = ttk.Radiobutton(
-            controls, text="All sites", variable=self.scope_var, value="all",
-            command=self._invalidate_preview,
-        )
-        scope_radio_all.grid(row=0, column=3, sticky="w")
-        self.scope_row_widgets = [scope_radio_site, self.site_combo, scope_radio_all]
-        self.scope_note_label = ttk.Label(controls, text="")
-        self.scope_note_label.grid(row=0, column=4, sticky="w", padx=(10, 0))
 
-        ttk.Label(controls, text="Script").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(8, 0))
-        self.plugin_combo = ttk.Combobox(controls, state="readonly", width=40)
-        self.plugin_combo["values"] = [self._plugins[pid].NAME for pid in self._plugin_ids]
-        self.plugin_combo.grid(row=1, column=1, columnspan=3, sticky="w", pady=(8, 0))
-        self.plugin_combo.bind("<<ComboboxSelected>>", lambda e: self._on_plugin_changed())
+        self.scope_radio_site = ttk.Radiobutton(
+            scope, text="One site", variable=self.scope_var, value="site", command=self._on_scope_changed)
+        self.scope_radio_site.grid(row=0, column=0, sticky="w")
+        self.site_combo = ttk.Combobox(scope, state="readonly", width=26)
+        self.site_combo.grid(row=1, column=0, sticky="ew", padx=(18, 0), pady=(2, 6))
+        self.site_combo.bind("<<ComboboxSelected>>", lambda e: self._on_scope_changed())
 
-        self.plugin_desc_label = ttk.Label(controls, text="", foreground="#666666", wraplength=520)
-        self.plugin_desc_label.grid(row=2, column=1, columnspan=4, sticky="w")
+        self.scope_radio_all = ttk.Radiobutton(
+            scope, text="All sites", variable=self.scope_var, value="all", command=self._on_scope_changed)
+        self.scope_radio_all.grid(row=2, column=0, sticky="w", pady=(0, 6))
 
-        self.param_frame = ttk.Frame(controls)
-        self.param_frame.grid(row=3, column=1, columnspan=4, sticky="w", pady=(6, 0))
+        self.scope_radio_selected = ttk.Radiobutton(
+            scope, text="Selected sites", variable=self.scope_var, value="selected",
+            command=self._on_scope_changed)
+        self.scope_radio_selected.grid(row=3, column=0, sticky="w")
 
+        link_row = ttk.Frame(scope)
+        link_row.grid(row=4, column=0, sticky="w", padx=(18, 0), pady=(2, 2))
+        self.select_all_link = tk.Label(link_row, text="Select all", fg="#1f4e8c", cursor="hand2",
+                                        font=("Segoe UI", 9, "underline"))
+        self.select_all_link.pack(side="left")
+        self.select_all_link.bind("<Button-1>", lambda e: self._set_all_checked(True))
+        self.clear_link = tk.Label(link_row, text="Clear", fg="#1f4e8c", cursor="hand2",
+                                   font=("Segoe UI", 9, "underline"))
+        self.clear_link.pack(side="left", padx=(12, 0))
+        self.clear_link.bind("<Button-1>", lambda e: self._set_all_checked(False))
+
+        check_outer = ttk.Frame(scope)
+        check_outer.grid(row=5, column=0, sticky="ew", padx=(18, 0))
+        check_outer.columnconfigure(0, weight=1)
+        self._check_canvas = tk.Canvas(check_outer, width=230, height=170, highlightthickness=1,
+                                       highlightbackground="#8a8a8a", background="#ffffff")
+        check_scroll = ttk.Scrollbar(check_outer, orient="vertical", command=self._check_canvas.yview)
+        self._check_canvas.configure(yscrollcommand=check_scroll.set)
+        self._check_canvas.grid(row=0, column=0, sticky="ew")
+        check_scroll.grid(row=0, column=1, sticky="ns")
+        self._check_inner = ttk.Frame(self._check_canvas)
+        self._check_window = self._check_canvas.create_window((0, 0), window=self._check_inner, anchor="nw")
+        self._check_inner.bind(
+            "<Configure>", lambda e: self._check_canvas.configure(scrollregion=self._check_canvas.bbox("all")))
+        self._check_canvas.bind(
+            "<Configure>", lambda e: self._check_canvas.itemconfigure(self._check_window, width=e.width))
+        for widget in (self._check_canvas, self._check_inner):
+            self._bind_wheel(widget)
+
+        self.scope_summary_label = ttk.Label(scope, text="", foreground="#555555")
+        self.scope_summary_label.grid(row=6, column=0, sticky="w", padx=(18, 0), pady=(4, 0))
+        self.scope_note_label = ttk.Label(scope, text="", foreground="#555555", wraplength=230)
+        self.scope_note_label.grid(row=7, column=0, sticky="w", pady=(4, 0))
+        self.refresh_sites_link = tk.Label(scope, text="Refresh site list", fg="#1f4e8c", cursor="hand2",
+                                           font=("Segoe UI", 9, "underline"))
+        self.refresh_sites_link.grid(row=8, column=0, sticky="w", pady=(4, 0))
+        self.refresh_sites_link.bind("<Button-1>", lambda e: self._refresh_site_choices())
+
+        # ---- Plugin list ----
+        plugin_box = ttk.LabelFrame(left, text="Plugins", padding=4)
+        plugin_box.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        plugin_box.rowconfigure(0, weight=1)
+        plugin_box.columnconfigure(0, weight=1)
+        self.plugin_list = tk.Listbox(
+            plugin_box, exportselection=False, activestyle="none", height=8, borderwidth=0,
+            highlightthickness=0, selectbackground="#1f4e8c", selectforeground="#ffffff",
+            font=("Segoe UI", 10))
+        self.plugin_list.grid(row=0, column=0, sticky="nsew")
+        plugin_scroll = ttk.Scrollbar(plugin_box, orient="vertical", command=self.plugin_list.yview)
+        plugin_scroll.grid(row=0, column=1, sticky="ns")
+        self.plugin_list.configure(yscrollcommand=plugin_scroll.set)
+        for pid in self._plugin_ids:
+            module = self._plugins[pid]
+            suffix = "  (standalone)" if orchestrator.is_standalone_plugin(module) else ""
+            self.plugin_list.insert("end", f"{module.NAME}{suffix}")
+        self.plugin_list.bind("<<ListboxSelect>>", lambda e: self._on_plugin_changed())
+
+        # ---- Detail ----
+        self.detail_frame = ttk.LabelFrame(right, text="Plugin", padding=10)
+        self.detail_frame.grid(row=0, column=0, sticky="ew")
+        self.detail_frame.columnconfigure(0, weight=1)
+        self.plugin_desc_label = ttk.Label(self.detail_frame, text="", wraplength=560, justify="left")
+        self.plugin_desc_label.grid(row=0, column=0, sticky="w")
+        self.plugin_facts_label = ttk.Label(self.detail_frame, text="", foreground="#555555")
+        self.plugin_facts_label.grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        # ---- Parameters ----
+        self.param_box = ttk.LabelFrame(right, text="Parameters", padding=10)
+        self.param_box.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self.param_frame = ttk.Frame(self.param_box)
+        self.param_frame.grid(row=0, column=0, sticky="w")
+        self.no_params_label = ttk.Label(self.param_box, text="This plugin has no parameters.",
+                                         foreground="#555555")
+
+        # ---- Run options ----
+        opts = ttk.LabelFrame(right, text="Run options", padding=10)
+        opts.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        self.workers_var = tk.IntVar(value=self._default_workers)
+        self.per_site_var = tk.IntVar(value=self._default_per_site)
+        ttk.Label(opts, text="Workers").grid(row=0, column=0, sticky="w")
+        self.workers_spin = ttk.Spinbox(opts, from_=1, to=64, width=5, textvariable=self.workers_var,
+                                        command=self._invalidate_preview)
+        self.workers_spin.grid(row=0, column=1, sticky="w", padx=(6, 24))
+        ttk.Label(opts, text="Max per site").grid(row=0, column=2, sticky="w")
+        self.per_site_spin = ttk.Spinbox(opts, from_=1, to=24, width=5, textvariable=self.per_site_var,
+                                         command=self._invalidate_preview)
+        self.per_site_spin.grid(row=0, column=3, sticky="w", padx=(6, 24))
         self.save_var = tk.BooleanVar(value=False)
         self.save_checkbox = ttk.Checkbutton(
-            controls, text="Save config after committing", variable=self.save_var,
-        )
-        self.save_checkbox.grid(row=4, column=1, columnspan=4, sticky="w", pady=(6, 0))
+            opts, text="Save config after committing", variable=self.save_var,
+            command=self._invalidate_preview)
+        self.save_checkbox.grid(row=0, column=4, sticky="w")
+        for var in (self.workers_var, self.per_site_var):
+            var.trace_add("write", lambda *a: self._invalidate_preview())
 
-        button_frame = ttk.Frame(controls)
-        button_frame.grid(row=0, column=5, rowspan=5, sticky="ns", padx=(20, 0))
-        self.preview_button = ttk.Button(button_frame, text="Preview (dry-run)", command=self._on_preview_clicked)
-        self.preview_button.pack(fill="x", pady=(0, 6))
+        # ---- Buttons ----
+        button_row = ttk.Frame(right)
+        button_row.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        self.preview_button = ttk.Button(button_row, text="Preview (dry-run)", command=self._on_preview_clicked)
+        self.preview_button.pack(side="left")
         self.commit_button = ttk.Button(
-            button_frame, text="Commit (apply changes)", command=self._on_commit_clicked, state="disabled",
-        )
-        self.commit_button.pack(fill="x")
+            button_row, text="Commit (apply changes)", command=self._on_commit_clicked, state="disabled")
+        self.commit_button.pack(side="left", padx=(8, 0))
+        self.stop_button = ttk.Button(button_row, text="Stop", command=self._on_stop_clicked, state="disabled")
+        self.stop_button.pack(side="left", padx=(8, 0))
+        self.preview_status_label = ttk.Label(button_row, text="Not yet previewed for the current settings.",
+                                              foreground="#555555")
+        self.preview_status_label.pack(side="left", padx=(14, 0))
 
-        ttk.Label(self, text="Console").grid(row=1, column=0, sticky="w", padx=10, pady=(6, 0))
-        self.preview_status_label = ttk.Label(self, text="Not yet previewed for the current settings.")
-        self.preview_status_label.grid(row=2, column=0, sticky="w", padx=10)
+        # ---- Progress ----
+        prog = ttk.Frame(right)
+        prog.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        prog.columnconfigure(0, weight=1)
+        self.progress_label = ttk.Label(prog, text="", foreground="#444444")
+        self.progress_label.grid(row=0, column=0, sticky="w")
+        self.progress_bar = ttk.Progressbar(prog, orient="horizontal", mode="determinate", maximum=100)
+        self.progress_bar.grid(row=1, column=0, sticky="ew", pady=(2, 0))
 
-        console_frame = ttk.Frame(self, padding=(10, 4, 10, 10))
-        console_frame.grid(row=3, column=0, sticky="nsew")
+        # ---- Console ----
+        console_frame = ttk.Frame(right)
+        console_frame.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
         console_frame.rowconfigure(0, weight=1)
         console_frame.columnconfigure(0, weight=1)
         self.console = scrolledtext.ScrolledText(
-            console_frame, height=16, state="disabled", wrap="word",
+            console_frame, height=12, state="disabled", wrap="word",
             background="#111111", foreground="#dddddd", insertbackground="#dddddd", font=("Consolas", 10),
         )
         self.console.grid(row=0, column=0, sticky="nsew")
 
-        self._invalidate_preview()
-        if self.plugin_combo["values"]:
-            self.plugin_combo.current(0)
+        if self._plugin_ids:
+            self.plugin_list.selection_set(0)
             self._on_plugin_changed()
+        else:
+            self._update_plugin_shape_widgets()
+            self._invalidate_preview()
 
+    def _bind_wheel(self, widget):
+        widget.bind("<MouseWheel>", lambda e: self._check_canvas.yview_scroll(int(-e.delta / 120), "units"))
+        widget.bind("<Button-4>", lambda e: self._check_canvas.yview_scroll(-1, "units"))
+        widget.bind("<Button-5>", lambda e: self._check_canvas.yview_scroll(1, "units"))
+
+    # ------------------------------------------------------------------
+    # Plugin selection
+    # ------------------------------------------------------------------
     def _selected_plugin_id(self):
-        idx = self.plugin_combo.current()
-        return self._plugin_ids[idx] if idx >= 0 else None
+        sel = self.plugin_list.curselection()
+        return self._plugin_ids[sel[0]] if sel else None
 
     def _on_plugin_changed(self):
         for widget in self.param_frame.winfo_children():
@@ -2244,19 +2378,47 @@ class CommandRunnerTab(ttk.Frame):
         plugin_id = self._selected_plugin_id()
         if plugin_id is not None:
             module = self._plugins[plugin_id]
+            self.detail_frame.configure(text=module.NAME)
             self.plugin_desc_label.configure(text=module.DESCRIPTION)
+            self.plugin_facts_label.configure(text=self._facts_text(module))
             for i, param in enumerate(module.PARAMS):
+                row, col = divmod(i, 2)
                 ttk.Label(self.param_frame, text=param["label"]).grid(
-                    row=i, column=0, sticky="w", padx=(0, 8), pady=2)
-                var = tk.StringVar()
+                    row=row, column=col * 2, sticky="w", padx=(0 if col == 0 else 24, 8), pady=3)
+                var = tk.StringVar(value=str(param.get("default", "") or ""))
                 var.trace_add("write", lambda *a: self._invalidate_preview())
-                ttk.Entry(self.param_frame, textvariable=var, width=30).grid(row=i, column=1, sticky="w", pady=2)
+                ttk.Entry(self.param_frame, textvariable=var, width=18).grid(
+                    row=row, column=col * 2 + 1, sticky="w", pady=3)
                 self._param_vars[param["name"]] = (var, param.get("required", True))
+            if module.PARAMS:
+                self.no_params_label.grid_remove()
+            else:
+                self.no_params_label.grid(row=1, column=0, sticky="w")
         else:
-            self.plugin_desc_label.configure(text="")
+            self.detail_frame.configure(text="Plugin")
+            self.plugin_desc_label.configure(text="No plugins found in utilities/plugins/.")
+            self.plugin_facts_label.configure(text="")
+            self.no_params_label.grid_remove()
 
         self._update_plugin_shape_widgets()
         self._invalidate_preview()
+        if not self._run_in_progress():
+            self.progress_label.configure(text="")
+            self.progress_bar.configure(mode="determinate", value=0)
+
+    @staticmethod
+    def _facts_text(module) -> str:
+        facts = []
+        if orchestrator.is_standalone_plugin(module):
+            facts.append("Runs: its own flow (standalone)")
+        else:
+            parallel = getattr(module, "PARALLEL", True) is not False
+            facts.append("Runs: " + ("in parallel" if parallel else "one device at a time"))
+        changes = getattr(module, "CHANGES_DEVICES", None)
+        if changes is not None:
+            facts.append("Changes devices: " + ("yes" if changes else "no"))
+        facts.append("Commit needs a preview first: yes")
+        return "     ".join(facts)
 
     def _is_standalone_plugin_selected(self) -> bool:
         plugin_id = self._selected_plugin_id()
@@ -2265,9 +2427,9 @@ class CommandRunnerTab(ttk.Frame):
         return orchestrator.is_standalone_plugin(self._plugins[plugin_id])
 
     def _update_plugin_shape_widgets(self):
-        """Standalone plugins own their entire device list - scope has
-        no meaning for them, so the scope controls are disabled and a
-        note explains why, rather than leaving a scope picker on
+        """Standalone plugins own their entire device list - scope and the
+        worker settings have no meaning for them, so those controls are
+        disabled and a note explains why, rather than leaving pickers on
         screen that this kind of script simply ignores. Saving is
         similarly outside the harness's control for this shape:
         run_standalone_plugin() doesn't even accept a save argument -
@@ -2275,56 +2437,184 @@ class CommandRunnerTab(ttk.Frame):
         entirely up to its own run() logic, so leaving the checkbox
         enabled would be actively misleading, not just irrelevant.
         """
-        if self._is_standalone_plugin_selected():
-            for child in self.scope_row_widgets:
-                child.configure(state="disabled")
-            self.scope_note_label.configure(text="This script manages its own device list.")
-            self.save_checkbox.configure(state="disabled")
-        else:
-            for child in self.scope_row_widgets:
-                child.configure(state="normal")
-            self.site_combo.configure(state="readonly" if self.scope_var.get() == "site" else "disabled")
-            self.scope_note_label.configure(text="")
-            self.save_checkbox.configure(state="normal")
+        standalone = self._is_standalone_plugin_selected()
+        for widget in (self.scope_radio_site, self.scope_radio_all, self.scope_radio_selected,
+                       self.workers_spin, self.per_site_spin, self.save_checkbox):
+            widget.configure(state="disabled" if standalone else "normal")
+        self.scope_note_label.configure(text="This script manages its own device list." if standalone else "")
+        self.stop_button.configure(state="disabled")
+        self._apply_scope_widget_states()
 
+    # ------------------------------------------------------------------
+    # Scope
+    # ------------------------------------------------------------------
+    def _apply_scope_widget_states(self):
+        standalone = self._is_standalone_plugin_selected()
+        mode = self.scope_var.get()
+        self.site_combo.configure(state="readonly" if (not standalone and mode == "site") else "disabled")
+        check_state = "normal" if (not standalone and mode == "selected") else "disabled"
+        for cb in self._site_rows.values():
+            cb.configure(state=check_state)
+        for link in (self.select_all_link, self.clear_link):
+            link.configure(fg="#1f4e8c" if check_state == "normal" else "#999999")
+        self._update_scope_summary()
+
+    def _on_scope_changed(self):
+        self._apply_scope_widget_states()
+        self._invalidate_preview()
+
+    def _set_all_checked(self, value: bool):
+        if self._is_standalone_plugin_selected() or self.scope_var.get() != "selected":
+            return
+        for var in self._site_vars.values():
+            var.set(value)
+        self._on_scope_changed()
+
+    def _checked_site_ids(self) -> list:
+        return [info["id"] for info in self._site_info if self._site_vars[info["id"]].get()]
+
+    def _scope_site_ids(self):
+        """What to hand run_plugin(): None = all sites, an int = one site,
+        a list = the ticked sites. "UNSET" = nothing chosen yet."""
+        mode = self.scope_var.get()
+        if mode == "all":
+            return None
+        if mode == "site":
+            if self.site_combo.current() < 0:
+                return "UNSET"
+            return self._site_keys[self.site_combo.current()]
+        ids = self._checked_site_ids()
+        return ids if ids else "UNSET"
+
+    def _scope_counts(self):
+        """(sites, devices) for the current scope."""
+        scope = self._scope_site_ids()
+        if scope == "UNSET":
+            return 0, 0
+        by_id = {info["id"]: info["devices"] for info in self._site_info}
+        if scope is None:
+            return len(self._site_info), sum(by_id.values())
+        ids = scope if isinstance(scope, list) else [scope]
+        return len(ids), sum(by_id.get(i, 0) for i in ids)
+
+    def _update_scope_summary(self):
+        if self._is_standalone_plugin_selected():
+            self.scope_summary_label.configure(text="")
+            return
+        sites, devices = self._scope_counts()
+        if sites == 0:
+            text = "No sites selected"
+        else:
+            text = f"{sites} site{'s' if sites != 1 else ''}, {devices} device{'s' if devices != 1 else ''} in scope"
+        self.scope_summary_label.configure(text=text)
+
+    def _refresh_site_choices(self):
+        """Reloads the site list (combobox and checklist), keeping the
+        current choice where those sites still exist."""
+        previous_combo_id = None
+        if self.site_combo.current() >= 0 and self._site_keys:
+            previous_combo_id = self._site_keys[self.site_combo.current()]
+        previously_checked = {sid for sid, var in self._site_vars.items() if var.get()}
+
+        with db.get_conn() as conn:
+            sites = db.get_all_sites(conn)
+            infos = []
+            for site in sites:
+                infos.append({
+                    "id": site["id"],
+                    "label": f"{site['site_name'] or site['site_octet']} ({site['site_octet']})",
+                    "devices": len(db.get_devices_for_site(conn, site["id"])),
+                })
+        if infos == self._site_info and self._site_rows is not None and (self._site_rows or not infos):
+            return  # nothing changed - keep the current preview valid
+        self._site_info = infos
+        self._site_keys = [i["id"] for i in infos]
+        self.site_combo["values"] = [i["label"] for i in infos]
+        if infos:
+            idx = self._site_keys.index(previous_combo_id) if previous_combo_id in self._site_keys else 0
+            self.site_combo.current(idx)
+        else:
+            self.site_combo.set("")
+
+        for child in self._check_inner.winfo_children():
+            child.destroy()
+        self._site_vars = {}
+        self._site_rows = {}
+        self._check_inner.columnconfigure(0, weight=1)
+        for r, info in enumerate(infos):
+            var = tk.BooleanVar(value=info["id"] in previously_checked)
+            var.trace_add("write", lambda *a: self._on_site_ticked())
+            self._site_vars[info["id"]] = var
+            cb = ttk.Checkbutton(self._check_inner, text=info["label"], variable=var)
+            cb.grid(row=r, column=0, sticky="w", padx=4, pady=1)
+            count = ttk.Label(self._check_inner, text=f"{info['devices']} dev", foreground="#777777",
+                              font=("Segoe UI", 8))
+            count.grid(row=r, column=1, sticky="e", padx=(8, 6))
+            for w in (cb, count):
+                self._bind_wheel(w)
+            self._site_rows[info["id"]] = cb
+        self._apply_scope_widget_states()
+        self._invalidate_preview()
+
+    def _on_site_ticked(self):
+        self._update_scope_summary()
+        self._invalidate_preview()
+
+    def _on_tab_shown(self):
+        # Sites may have been added/renamed in Site Manager since this tab
+        # was built; reload when the tab is shown, but never mid-run.
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            return
+        try:
+            self._refresh_site_choices()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Parameters, run options, signature
+    # ------------------------------------------------------------------
     def _current_params(self):
         return {name: var.get().strip() for name, (var, _required) in self._param_vars.items()}
 
     def _missing_required_params(self):
         return [name for name, (var, required) in self._param_vars.items() if required and not var.get().strip()]
 
-    def _current_site_id(self):
-        if self.scope_var.get() == "all":
+    def _read_int(self, var, fallback):
+        try:
+            n = int(var.get())
+        except (tk.TclError, ValueError):
             return None
-        if self.site_combo.current() < 0:
-            return "UNSET"
-        return self._site_keys[self.site_combo.current()]
+        return n if n > 0 else None
 
     def _current_signature(self):
-        site_component = "N/A" if self._is_standalone_plugin_selected() else self._current_site_id()
-        return (site_component, self._selected_plugin_id(), tuple(sorted(self._current_params().items())))
+        if self._is_standalone_plugin_selected():
+            scope_component, workers, per_site = "N/A", "N/A", "N/A"
+        else:
+            scope = self._scope_site_ids()
+            if scope is None:
+                scope_component = "ALL"
+            elif isinstance(scope, list):
+                scope_component = ("SITES", tuple(sorted(scope)))
+            else:
+                scope_component = scope
+            workers = self._read_int(self.workers_var, None)
+            per_site = self._read_int(self.per_site_var, None)
+        return (scope_component, self._selected_plugin_id(), tuple(sorted(self._current_params().items())),
+                workers, per_site, bool(self.save_var.get()))
 
     def _invalidate_preview(self):
         """Called on ANY change to scope, plugin selection, a param
-        value, or the save checkbox - forces a fresh Preview before
-        Commit can be used again, since a previous preview no longer
-        reflects what's currently configured.
+        value, the worker settings or the save checkbox - forces a fresh
+        Preview before Commit can be used again, since a previous preview
+        no longer reflects what's currently configured.
         """
-        if not self._is_standalone_plugin_selected():
-            self.site_combo.configure(state="readonly" if self.scope_var.get() == "site" else "disabled")
         self._last_previewed_signature = None
         self.commit_button.configure(state="disabled")
         self.preview_status_label.configure(text="Not yet previewed for the current settings.")
 
-    def _refresh_site_choices(self):
-        with db.get_conn() as conn:
-            sites = db.get_all_sites(conn)
-        self._site_keys = [site["id"] for site in sites]
-        display_values = [f"{site['site_name'] or site['site_octet']} ({site['site_octet']})" for site in sites]
-        self.site_combo["values"] = display_values
-        if display_values:
-            self.site_combo.current(0)
-
+    # ------------------------------------------------------------------
+    # Console / progress / queue
+    # ------------------------------------------------------------------
     def _append_console(self, text: str):
         self.console.configure(state="normal")
         self.console.insert("end", text)
@@ -2336,32 +2626,74 @@ class CommandRunnerTab(ttk.Frame):
         self.console.delete("1.0", "end")
         self.console.configure(state="disabled")
 
+    def _set_progress(self, done_devices, total_devices, done_sites, total_sites):
+        pct = (done_devices / total_devices * 100) if total_devices else 100
+        self.progress_bar.configure(mode="determinate", value=pct)
+        self.progress_label.configure(
+            text=f"Progress: {done_sites} of {total_sites} sites finished, "
+                 f"{done_devices} of {total_devices} devices")
+
     def _poll_queue(self):
         try:
             while True:
                 item = self._output_queue.get_nowait()
                 if item is _DONE:
-                    self.preview_button.configure(state="normal")
-                    completion = self._pending_completion
-                    self._pending_completion = None
-                    if completion and completion["success"] and not completion["commit"]:
-                        self._last_previewed_signature = completion["signature"]
-                        if completion["signature"] == self._current_signature():
-                            self.commit_button.configure(state="normal")
-                            self.preview_status_label.configure(text="Previewed - ready to commit.")
-                    if completion and completion["commit"]:
-                        # A commit always consumes the preview it was
-                        # checked against - force a fresh one before
-                        # any further commit, success or not.
-                        self._last_previewed_signature = None
-                        self.commit_button.configure(state="disabled")
-                        self.preview_status_label.configure(text="Not yet previewed for the current settings.")
+                    self._on_run_finished()
+                elif isinstance(item, tuple) and item and item[0] == "progress":
+                    self._set_progress(*item[1:])
                 else:
                     self._append_console(item)
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
 
+    def _on_run_finished(self):
+        if str(self.progress_bar.cget("mode")) == "indeterminate":
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="determinate", value=100)
+            self.progress_label.configure(text="Standalone plugin finished.")
+        self.preview_button.configure(state="normal")
+        self.stop_button.configure(state="disabled")
+        self._set_run_controls_enabled(True)
+        completion = self._pending_completion
+        self._pending_completion = None
+        if completion and completion["success"] and not completion["commit"]:
+            self._last_previewed_signature = completion["signature"]
+            if completion["signature"] == self._current_signature():
+                self.commit_button.configure(state="normal")
+                self.preview_status_label.configure(text="Previewed - ready to commit.")
+        elif completion and completion.get("stopped") and not completion["commit"]:
+            self.preview_status_label.configure(text="Preview stopped early - run it again to unlock Commit.")
+        if completion and completion["commit"]:
+            # A commit always consumes the preview it was
+            # checked against - force a fresh one before
+            # any further commit, success or not.
+            self._last_previewed_signature = None
+            self.commit_button.configure(state="disabled")
+            self.preview_status_label.configure(text="Not yet previewed for the current settings.")
+
+    def _set_run_controls_enabled(self, enabled: bool):
+        """Scope, plugin list and parameters are frozen while a run is in
+        flight so the run can't drift from what was previewed."""
+        state = "normal" if enabled else "disabled"
+        self.plugin_list.configure(state=state)
+        for child in self.param_frame.winfo_children():
+            try:
+                child.configure(state=state)
+            except tk.TclError:
+                pass
+        if enabled:
+            self._update_plugin_shape_widgets()
+        else:
+            for widget in (self.scope_radio_site, self.scope_radio_all, self.scope_radio_selected,
+                           self.workers_spin, self.per_site_spin, self.save_checkbox, self.site_combo):
+                widget.configure(state="disabled")
+            for cb in self._site_rows.values():
+                cb.configure(state="disabled")
+
+    # ------------------------------------------------------------------
+    # Running
+    # ------------------------------------------------------------------
     def _ensure_tacacs_available(self) -> bool:
         """The credential store is guaranteed unlocked (login succeeded
         before this tab was ever built) - this just confirms the
@@ -2375,32 +2707,45 @@ class CommandRunnerTab(ttk.Frame):
         return True
 
     def _validate_before_run(self):
-        if not self._is_standalone_plugin_selected() and self.scope_var.get() == "site" and self.site_combo.current() < 0:
-            messagebox.showwarning("Command Runner", "Choose a site first, or select 'All sites'.")
-            return False
         if self._selected_plugin_id() is None:
-            messagebox.showwarning("Command Runner", "Choose a script to run.")
+            messagebox.showwarning("Command Runner", "Choose a plugin to run.")
             return False
+        if not self._is_standalone_plugin_selected():
+            if self._scope_site_ids() == "UNSET":
+                mode = self.scope_var.get()
+                if mode == "site":
+                    msg = "Choose a site first, or pick a different scope."
+                elif mode == "selected":
+                    msg = "Tick at least one site, or choose 'All sites'."
+                else:
+                    msg = "There are no sites to run against."
+                messagebox.showwarning("Command Runner", msg)
+                return False
+            if self._read_int(self.workers_var, None) is None or self._read_int(self.per_site_var, None) is None:
+                messagebox.showwarning("Command Runner", "Workers and Max per site must be whole numbers of 1 or more.")
+                return False
         missing = self._missing_required_params()
         if missing:
-            labels = [self._plugins[self._selected_plugin_id()].PARAMS[i]["label"]
-                      for i, p in enumerate(self._plugins[self._selected_plugin_id()].PARAMS) if p["name"] in missing]
+            module = self._plugins[self._selected_plugin_id()]
+            labels = [p["label"] for p in module.PARAMS if p["name"] in missing]
             messagebox.showwarning("Command Runner", f"Fill in required field(s): {', '.join(labels)}")
             return False
         return True
 
+    def _run_in_progress(self) -> bool:
+        return self._worker_thread is not None and self._worker_thread.is_alive()
+
     def _on_preview_clicked(self):
-        if self._worker_thread is not None and self._worker_thread.is_alive():
+        if self._run_in_progress():
             return
         if not self._validate_before_run():
             return
         if not self._ensure_tacacs_available():
             return
-
         self._start_run(commit=False, save=False, signature=self._current_signature())
 
     def _on_commit_clicked(self):
-        if self._worker_thread is not None and self._worker_thread.is_alive():
+        if self._run_in_progress():
             return
         if not self._validate_before_run():
             return
@@ -2410,34 +2755,61 @@ class CommandRunnerTab(ttk.Frame):
                 "Settings have changed since the last preview - run Preview again before committing.",
             )
             return
-        if not messagebox.askyesno(
-            "Confirm commit",
-            "This will push real configuration changes to the devices shown in the last preview. Continue?",
-        ):
+        if self._is_standalone_plugin_selected():
+            prompt = "This will push real configuration changes using this plugin's own device list. Continue?"
+        else:
+            sites, devices = self._scope_counts()
+            prompt = (f"This will push real configuration changes to up to {devices} device(s) across "
+                      f"{sites} site(s), as shown in the last preview. Continue?")
+        if not messagebox.askyesno("Confirm commit", prompt):
             return
         if not self._ensure_tacacs_available():
             return
-
         self._start_run(commit=True, save=self.save_var.get(), signature=None)
+
+    def _on_stop_clicked(self):
+        if self._stop_event is not None and not self._stop_event.is_set():
+            self._stop_event.set()
+            self.stop_button.configure(state="disabled")
+            self.preview_status_label.configure(
+                text="Stopping - devices already in progress will finish; the rest are skipped.")
 
     def _start_run(self, commit, save, signature):
         plugin_id = self._selected_plugin_id()
         params = self._current_params()
-        site_id = self._current_site_id()
+        standalone = self._is_standalone_plugin_selected()
+        site_ids = None if standalone else self._scope_site_ids()
+        workers = None if standalone else self._read_int(self.workers_var, None)
+        per_site = None if standalone else self._read_int(self.per_site_var, None)
         creds = self._creds
 
         self._clear_console()
         self.preview_button.configure(state="disabled")
         self.commit_button.configure(state="disabled")
+        self._set_run_controls_enabled(False)
+        self._stop_event = threading.Event()
+        if standalone:
+            self.stop_button.configure(state="disabled")
+            self.progress_label.configure(text="Running (standalone plugin)...")
+            self.progress_bar.configure(mode="indeterminate")
+            self.progress_bar.start(15)
+        else:
+            self.stop_button.configure(state="normal")
+            self._set_progress(0, 0, 0, 0)
+            self.progress_label.configure(text="Starting...")
+            self.progress_bar.configure(mode="determinate", value=0)
+        self.preview_status_label.configure(text="Running...")
 
         self._worker_thread = threading.Thread(
             target=self._run_worker,
-            args=(plugin_id, params, site_id, creds, commit, save, signature),
+            args=(plugin_id, params, site_ids, workers, per_site, creds, commit, save, signature,
+                  self._stop_event),
             daemon=True,
         )
         self._worker_thread.start()
 
-    def _run_worker(self, plugin_id, params, site_id, creds, commit, save, signature):
+    def _run_worker(self, plugin_id, params, site_ids, workers, per_site, creds, commit, save, signature,
+                    stop_event):
         original_stdout = sys.stdout
         sys.stdout = _QueueWriter(self._output_queue)
         success = False
@@ -2450,17 +2822,23 @@ class CommandRunnerTab(ttk.Frame):
                     module, params, username, password, secret=secret, commit=commit,
                 )
             else:
+                def on_progress(done_devices, total_devices, done_sites, total_sites):
+                    self._output_queue.put(("progress", done_devices, total_devices, done_sites, total_sites))
+
                 with db.get_conn() as conn:
                     orchestrator.run_plugin(
-                        conn, module, params, site_id, username, password,
+                        conn, module, params, site_ids, username, password,
                         secret=secret, commit=commit, save=save,
+                        max_workers=workers, per_site_limit=per_site,
+                        progress_cb=on_progress, stop_event=stop_event,
                     )
-            success = True
+            success = not stop_event.is_set()
         except Exception as e:
             print(f"ERROR: {e}")
         finally:
             sys.stdout = original_stdout
-            self._pending_completion = {"commit": commit, "signature": signature, "success": success}
+            self._pending_completion = {"commit": commit, "signature": signature, "success": success,
+                                        "stopped": stop_event.is_set()}
             self._output_queue.put(_DONE)
 
 
