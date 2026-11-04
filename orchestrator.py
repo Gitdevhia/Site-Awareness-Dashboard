@@ -1397,12 +1397,19 @@ def list_plugins() -> dict:
         return plugins
     if PLUGINS_DIR not in sys.path:
         sys.path.insert(0, PLUGINS_DIR)
+    importlib.invalidate_caches()  # so plugin files added since the last scan are found
     for fname in sorted(os.listdir(PLUGINS_DIR)):
         if not fname.endswith(".py") or fname.startswith("_"):
             continue
         mod_name = fname[:-3]
         try:
-            module = importlib.import_module(mod_name)
+            # Re-read from disk on every scan: import_module() alone
+            # returns the cached module, so edits to a plugin would
+            # otherwise never show up until the app was relaunched.
+            if mod_name in sys.modules:
+                module = importlib.reload(sys.modules[mod_name])
+            else:
+                module = importlib.import_module(mod_name)
             has_core = all(hasattr(module, attr) for attr in ("NAME", "DESCRIPTION", "PARAMS"))
             has_plan = hasattr(module, "plan")
             has_run = hasattr(module, "run")
