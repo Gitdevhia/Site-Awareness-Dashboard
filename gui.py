@@ -2392,10 +2392,10 @@ class CommandRunnerTab(ttk.Frame):
         alone so a valid preview isn't thrown away for nothing. Skipped
         entirely while a run is in flight."""
         if self._run_in_progress():
-            print("[refresh debug] Command Runner: skipped, a run is in progress")  # TEMP
+            _refresh_debug("Command Runner: skipped, a run is in progress")  # TEMP
             return
         fingerprint = self._plugin_fingerprint()
-        print(f"[refresh debug] Command Runner: scanning {orchestrator.PLUGINS_DIR}; "
+        _refresh_debug(f"Command Runner: scanning {orchestrator.PLUGINS_DIR}; "
               f"{len(fingerprint)} plugin files; changed since last scan: "
               f"{fingerprint != getattr(self, '_plugin_fingerprint_seen', None)}")  # TEMP
         if fingerprint != getattr(self, "_plugin_fingerprint_seen", None):
@@ -2404,7 +2404,7 @@ class CommandRunnerTab(ttk.Frame):
 
             self._plugins = orchestrator.list_plugins()
             self._plugin_ids = sorted(self._plugins)
-            print(f"[refresh debug] Command Runner: loaded plugins {self._plugin_ids}")  # TEMP
+            _refresh_debug(f"Command Runner: loaded plugins {self._plugin_ids}")  # TEMP
             self.plugin_list.delete(0, "end")
             for pid in self._plugin_ids:
                 module = self._plugins[pid]
@@ -3199,6 +3199,19 @@ class CredentialsTab(ttk.Frame):
         db.log_activity("delete_credential_type", f"Deleted '{type_name}'")
 
 
+def _refresh_debug(msg: str):  # TEMP
+    """Temporary: appends to refresh_debug.log next to gui.py (and prints),
+    so it works even when the app is launched without a console."""
+    line = f"[refresh debug] {msg}"
+    print(line)
+    try:
+        import datetime
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "refresh_debug.log"), "a", encoding="utf-8") as f:
+            f.write(f"{datetime.datetime.now():%H:%M:%S} {line}\n")
+    except Exception:
+        pass
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -3245,11 +3258,12 @@ class App(tk.Tk):
         # write_queue.py's module docstring for the full design.
         self._drain_in_progress = False
         self._schedule_periodic_drain()
+        _refresh_debug(f"app started from {os.path.abspath(__file__)}")  # TEMP
 
     def _on_tab_changed(self, event=None):
         tab = self.nametowidget(self.notebook.select())
         refresh = getattr(tab, "refresh", None)
-        print(f"[refresh debug] tab switched to {type(tab).__name__}; has refresh(): {callable(refresh)}")  # TEMP
+        _refresh_debug(f"tab switched to {type(tab).__name__}; has refresh(): {callable(refresh)}")  # TEMP
         if callable(refresh):
             try:
                 refresh()

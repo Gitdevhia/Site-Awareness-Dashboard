@@ -8,3 +8,4 @@ dashboard/
 __pycache__/
 *.pyc
 .vscode
+refresh_debug.log
