@@ -3264,11 +3264,16 @@ class App(tk.Tk):
         # <<NotebookTabChanged>> for any reason, notice the selection
         # change by polling and run the same handler.
         self._last_tab = notebook.select()
+        self._poll_ticks = 0
         self.after(250, self._poll_selected_tab)
+        _refresh_debug("build poll-backup-v2: tab poller started; selected = " + repr(self._last_tab))  # TEMP
 
     def _poll_selected_tab(self):
         try:
             current = self.notebook.select()
+            self._poll_ticks += 1
+            if self._poll_ticks in (1, 20, 80):  # TEMP: proves the poller is alive (~0.25s, 5s, 20s)
+                _refresh_debug(f"poller tick {self._poll_ticks}; selected = {current!r}")
             if current != self._last_tab:
                 _refresh_debug(f"poll noticed a tab change the event did not report: {current!r}")  # TEMP
                 self._on_tab_changed()
