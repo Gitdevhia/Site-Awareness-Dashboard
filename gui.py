@@ -3263,10 +3263,16 @@ class App(tk.Tk):
         # Backup for the event above: if Tk doesn't deliver
         # <<NotebookTabChanged>> for any reason, notice the selection
         # change by polling and run the same handler.
+        # Make sure the handler's prerequisites exist even if an earlier
+        # part of this setup is missing from a merged copy of this file.
+        self.notebook = notebook
+        if not notebook.bind("<<NotebookTabChanged>>"):
+            notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+            _refresh_debug("NotebookTabChanged binding was missing; attached it")  # TEMP
         self._last_tab = notebook.select()
         self._poll_ticks = 0
         self.after(250, self._poll_selected_tab)
-        _refresh_debug("build poll-backup-v2: tab poller started; selected = " + repr(self._last_tab))  # TEMP
+        _refresh_debug("build poll-backup-v3: tab poller started; selected = " + repr(self._last_tab))  # TEMP
 
     def _poll_selected_tab(self):
         try:
