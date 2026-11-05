@@ -3260,9 +3260,25 @@ class App(tk.Tk):
         self._schedule_periodic_drain()
         _refresh_debug(f"app started from {os.path.abspath(__file__)}")  # TEMP
         _refresh_debug(f"NotebookTabChanged bindings on notebook: {notebook.bind('<<NotebookTabChanged>>')!r}")  # TEMP
+        # Backup for the event above: if Tk doesn't deliver
+        # <<NotebookTabChanged>> for any reason, notice the selection
+        # change by polling and run the same handler.
+        self._last_tab = notebook.select()
+        self.after(250, self._poll_selected_tab)
+
+    def _poll_selected_tab(self):
+        try:
+            current = self.notebook.select()
+            if current != self._last_tab:
+                _refresh_debug(f"poll noticed a tab change the event did not report: {current!r}")  # TEMP
+                self._on_tab_changed()
+        except Exception as e:
+            _refresh_debug(f"tab poll error: {e}")  # TEMP
+        self.after(250, self._poll_selected_tab)
 
     def _on_tab_changed(self, event=None):
-        _refresh_debug(f"<<NotebookTabChanged>> fired; selected = {self.notebook.select()!r}")  # TEMP
+        self._last_tab = self.notebook.select()
+        _refresh_debug(f"<<NotebookTabChanged>> handler running; selected = {self._last_tab!r}")  # TEMP
         try:
             tab = self.nametowidget(self.notebook.select())
             refresh = getattr(tab, "refresh", None)
