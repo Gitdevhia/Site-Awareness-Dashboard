@@ -164,6 +164,13 @@ def run_import(path: str, apply: bool, force: bool, check_only: bool) -> int:
     print(f"{'Imported' if apply else 'Would import'}: {summary['added']} added, {summary['updated']} updated, "
           f"{summary['reactivated']} brought back, {summary['skipped']} skipped, {summary['errors']} with errors, "
           f"{summary['missing']} missing from the file, {summary['associations']} security associations.")
+    if summary.get("took_over"):
+        print(f"{len(summary['took_over'])} hand-entered KG(s) are now fed by GEM One (their serial is in the file):")
+        _print_list(summary["took_over"], 20)
+    if summary.get("possible_matches"):
+        print("Possible duplicates: a new GEM One unit shares an IP with a hand-entered one. If they are the same unit, "
+              "open the hand-entered one with Edit on the KG devices tab and enter the real serial:")
+        _print_list([f"{new} has the same IP as {manual}" for new, manual in summary["possible_matches"]], 20)
     if summary["unmapped"]:
         print(f"{len(summary['unmapped'])} KG(s) have no site assigned and are in Unassigned:")
         _print_list(summary["unmapped"], 20)
@@ -226,7 +233,7 @@ def run_list() -> int:
     print(f"{'Health':9} {'Name':24} {'Serial':18} {'Site':14} {'State':16} {'KEYMAT':>7} {'Battery':>8} {'SAs':>5}")
     for k in rows:
         ev = kg_health.evaluate(dict(k), cfg, unreachable=k["assoc_unreachable"])
-        flags = (" MISSING" if k["missing_since"] else "") + (" ERROR" if k["last_error"] else "")
+        flags = (" MISSING" if k["missing_since"] else "") + (" ERROR" if k["last_error"] else "") + (" MANUAL" if k["source"] == "manual" else "")
         days = "-" if ev["keymat_days"] is None else f"{ev['keymat_days']}d"
         years = "-" if ev["battery_years"] is None else f"{ev['battery_years']}y"
         site = k["site_octet"] or "?"

@@ -36,6 +36,7 @@ Design notes (decided during planning, not obvious from the code alone):
   get_best_ip_for_device().
 """
 
+import re
 import sqlite3
 import ipaddress
 import hashlib
@@ -371,7 +372,8 @@ CREATE TABLE IF NOT EXISTS kg_devices (
     missing_since       TEXT,   -- set when a newer file no longer lists it; cleared when it returns
     last_error          TEXT,   -- the script could not read this device on its last run
     last_error_at       TEXT,
-    deleted_at          TEXT
+    deleted_at          TEXT,
+    source              TEXT NOT NULL DEFAULT 'gemone'   -- 'gemone' (from a GEM One file) or 'manual' (entered by hand)
 );
 
 CREATE TABLE IF NOT EXISTS kg_security_associations (
@@ -549,6 +551,8 @@ def init_db(db_path: str = DB_PATH) -> None:
         # from scratch since (this call is a safe no-op otherwise).
         _ensure_column(conn, "devices", "marked_stale_at", "TEXT")
         _ensure_column(conn, "sites", "last_tunnel_collection", "TEXT")
+        # KG units entered by hand (not reachable by GEM One) vs imported ones.
+        _ensure_column(conn, "kg_devices", "source", "TEXT NOT NULL DEFAULT 'gemone'")
 
 
 # ---------------------------------------------------------------------
@@ -2027,7 +2031,8 @@ def import_kg_snapshot(conn, data: dict, source: str = None, force: bool = False
                              "Use force to import it anyway.")
 
     summary = {"file_collected_at": collected, "added": 0, "updated": 0, "reactivated": 0, "skipped": 0,
-               "errors": 0, "missing": 0, "associations": 0, "unmapped": [], "warnings": []}
+               "errors": 0, "missing": 0, "associations": 0, "unmapped": [], "warnings": [],
+               "took_over": [], "possible_matches": []}
     warnings = summary["warnings"]
     site_map = {r["serial_number"]: r["site_id"] for r in conn.execute("SELECT serial_number, site_id FROM kg_site_map")}
     known = get_site_by_octet(conn, UNASSIGNED_SITE_OCTET)
@@ -2070,6 +2075,16 @@ def import_kg_snapshot(conn, data: dict, source: str = None, force: bool = False
                 [serial, now] + [values[c] for c in values])
             kg_id = cur.lastrowid
             summary["added"] += 1
+            # A new GEM One unit that shares an IP with a hand-entered one is
+            # probably the same physical unit. Reported, never merged by itself
+            # (IP addresses get reused).
+            ips = [ip for ip in (values.get("pt_ip"), values.get("ct_ip")) if ip]
+            if ips:
+                marks = ", ".join("?" for _ in ips)
+                for m in conn.execute(
+                        f"SELECT serial_number FROM kg_devices WHERE source = 'manual' AND deleted_at IS NULL "
+                        f"AND (pt_ip IN ({marks}) OR ct_ip IN ({marks}))", ips + ips).fetchall():
+                    summary["possible_matches"].append((serial, m["serial_number"]))
             if values["state"]:
                 conn.execute("INSERT INTO kg_state_log (kg_id, at, old_state, new_state) VALUES (?, ?, NULL, ?)",
                              (kg_id, now, values["state"]))
@@ -2077,10 +2092,12 @@ def import_kg_snapshot(conn, data: dict, source: str = None, force: bool = False
             kg_id = existing["id"]
             if existing["deleted_at"]:
                 summary["reactivated"] += 1
+            if existing["source"] == "manual":
+                summary["took_over"].append(serial)   # GEM One data now owns this unit
             sets = ", ".join(f"{c} = ?" for c in values)
             conn.execute(
-                f"UPDATE kg_devices SET {sets}, missing_since = NULL, last_error = NULL, last_error_at = NULL, "
-                f"deleted_at = NULL WHERE id = ?", [values[c] for c in values] + [kg_id])
+                f"UPDATE kg_devices SET {sets}, source = 'gemone', missing_since = NULL, last_error = NULL, "
+                f"last_error_at = NULL, deleted_at = NULL WHERE id = ?", [values[c] for c in values] + [kg_id])
             summary["updated"] += 1
             if (existing["state"] or None) != values["state"]:
                 conn.execute("INSERT INTO kg_state_log (kg_id, at, old_state, new_state) VALUES (?, ?, ?, ?)",
@@ -2114,7 +2131,9 @@ def import_kg_snapshot(conn, data: dict, source: str = None, force: bool = False
                      "WHERE serial_number = ?", (message, now, serial))
 
     present = seen | error_serials
-    for row in conn.execute("SELECT id, serial_number FROM kg_devices WHERE deleted_at IS NULL").fetchall():
+    # Hand-entered units are never in a GEM One file, so they are never "missing".
+    for row in conn.execute(
+            "SELECT id, serial_number FROM kg_devices WHERE deleted_at IS NULL AND source != 'manual'").fetchall():
         if row["serial_number"] not in present:
             conn.execute("UPDATE kg_devices SET missing_since = COALESCE(missing_since, ?) WHERE id = ?", (now, row["id"]))
             summary["missing"] += 1
@@ -2169,6 +2188,181 @@ def soft_delete_kg_device(conn, serial_number: str) -> None:
     conn.execute("UPDATE kg_devices SET deleted_at = ? WHERE serial_number = ? AND deleted_at IS NULL",
                  (_now(), _kg_clean(serial_number)))
     log_activity("delete_kg", f"KG {serial_number} hidden", conn=conn)
+
+
+# ---------------------------------------------------------------------
+# KG units entered by hand (source = 'manual')
+#
+# For a TACLANE/ViaSat that is up and working but that GEM One cannot see.
+# Only the type is required: the unit exists so the security-association
+# tables can show a name for it instead of "not in SAD". The match is by
+# PT/CT IP address, so those are worth filling in when known.
+# ---------------------------------------------------------------------
+
+def _kg_check_ip(value, label: str):
+    text = _kg_clean(value)
+    if text is None:
+        return None
+    try:
+        ipaddress.ip_address(text)
+    except ValueError:
+        raise ValueError(f"{label} '{text}' is not a valid IP address") from None
+    return text
+
+
+def _kg_check_date(value, label: str):
+    text = _kg_clean(value)
+    if text is None:
+        return None
+    try:
+        datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError(f"{label} must be a date written YYYY-MM-DD") from None
+    return text
+
+
+def _kg_ip_conflict(conn, ips, exclude_id=None) -> None:
+    """Raises when another KG already uses one of these IPs (the SA peer
+    lookup keeps only one unit per IP, so a shared IP would show the wrong name)."""
+    ips = [ip for ip in ips if ip]
+    if not ips:
+        return
+    marks = ", ".join("?" for _ in ips)
+    rows = conn.execute(
+        f"SELECT id, serial_number, system_name, pt_ip, ct_ip FROM kg_devices WHERE deleted_at IS NULL "
+        f"AND (pt_ip IN ({marks}) OR ct_ip IN ({marks}))", ips + ips).fetchall()
+    for r in rows:
+        if exclude_id is not None and r["id"] == exclude_id:
+            continue
+        shared = sorted({ip for ip in ips if ip in (r["pt_ip"], r["ct_ip"])})
+        raise ValueError(f"{', '.join(shared)} is already used by {r['system_name'] or r['serial_number']} "
+                         f"({r['serial_number']}). Each IP can belong to only one KG.")
+
+
+def _kg_next_serial(conn, device_type: str) -> str:
+    """'<type>-<n>' with n one above the highest used for this type. Removed
+    units count too, so a number is never handed out twice."""
+    pattern = re.compile(r"^" + re.escape(device_type) + r"-(\d+)$", re.IGNORECASE)
+    highest = 0
+    for r in conn.execute("SELECT serial_number FROM kg_devices").fetchall():
+        m = pattern.match(r["serial_number"])
+        if m:
+            highest = max(highest, int(m.group(1)))
+    return f"{device_type}-{highest + 1}"
+
+
+def _kg_manual_validate(conn, device_type, site_id, pt_ip, ct_ip, ffvs_exp_date, battery_change_date,
+                        requested_serial, editing_serial=None):
+    """Every check an add or edit has to pass, with no writes. Returns
+    (existing_row_or_None, cleaned_values, final_serial_or_None); raises
+    ValueError with a plain message. final_serial is None only for an add
+    with no serial given (one is generated when the add is applied)."""
+    row = None
+    if editing_serial:
+        serial = _kg_clean(editing_serial)
+        row = conn.execute("SELECT * FROM kg_devices WHERE serial_number = ?", (serial,)).fetchone()
+        if row is None:
+            raise ValueError(f"No KG with serial {serial}")
+        if row["source"] != "manual":
+            raise ValueError(f"{serial} comes from GEM One and cannot be edited here")
+    device_type = _kg_clean(device_type)
+    if not device_type:
+        raise ValueError("A type is required")
+    values = {
+        "device_type": device_type,
+        "pt_ip": _kg_check_ip(pt_ip, "PT IP"),
+        "ct_ip": _kg_check_ip(ct_ip, "CT IP"),
+        "ffvs_exp_date": _kg_check_date(ffvs_exp_date, "KEYMAT expiry"),
+        "battery_change_date": _kg_check_date(battery_change_date, "Battery change date"),
+    }
+    _kg_ip_conflict(conn, [values["pt_ip"], values["ct_ip"]], exclude_id=row["id"] if row is not None else None)
+    requested = _kg_clean(requested_serial)
+    if row is not None:
+        final = requested or row["serial_number"]
+        if final != row["serial_number"] and conn.execute(
+                "SELECT 1 FROM kg_devices WHERE serial_number = ?", (final,)).fetchone():
+            raise ValueError(f"A KG with serial {final} already exists")
+    else:
+        final = requested
+        if final and conn.execute("SELECT 1 FROM kg_devices WHERE serial_number = ?", (final,)).fetchone():
+            raise ValueError(f"A KG with serial {final} already exists (it may have been removed; "
+                             f"a removed unit comes back when a GEM One file lists it).")
+    if site_id is not None and conn.execute("SELECT 1 FROM sites WHERE id = ?", (site_id,)).fetchone() is None:
+        raise ValueError(f"No site with id {site_id}")
+    return row, values, final
+
+
+def check_manual_kg(conn, device_type, site_id=None, pt_ip=None, ct_ip=None, ffvs_exp_date=None,
+                    battery_change_date=None, serial_number=None, editing_serial=None):
+    """The checks an add/edit would have to pass, without writing anything.
+    Returns None if it would be accepted, else the problem as plain text.
+    The GUI calls this before queueing the write, so a mistake in the form
+    never reaches the write queue (a queued write that fails is kept there
+    and retried on every drain)."""
+    try:
+        _kg_manual_validate(conn, device_type, site_id, pt_ip, ct_ip, ffvs_exp_date, battery_change_date,
+                            serial_number, editing_serial)
+    except ValueError as e:
+        return str(e)
+    return None
+
+
+def add_manual_kg(conn, device_type: str, site_id: int = None, system_name: str = None, pt_ip: str = None,
+                  ct_ip: str = None, serial_number: str = None, state: str = None, software_version: str = None,
+                  ffvs_exp_date: str = None, battery_change_date: str = None) -> str:
+    """Adds a hand-entered KG and returns its serial number. Only device_type
+    is required; a blank serial_number is generated as '<type>-<n>'."""
+    _row, v, serial = _kg_manual_validate(conn, device_type, site_id, pt_ip, ct_ip, ffvs_exp_date,
+                                          battery_change_date, serial_number)
+    if not serial:
+        serial = _kg_next_serial(conn, v["device_type"])
+    actual_site = site_id if site_id is not None else get_or_create_unassigned_site(conn)
+    now = _now()
+    state = _kg_clean(state)
+    cur = conn.execute(
+        "INSERT INTO kg_devices (serial_number, site_id, system_name, device_type, state, software_version, "
+        "pt_ip, ct_ip, ffvs_exp_date, battery_change_date, first_seen, last_seen, source) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual')",
+        (serial, actual_site, _kg_clean(system_name), v["device_type"], state, _kg_clean(software_version),
+         v["pt_ip"], v["ct_ip"], v["ffvs_exp_date"], v["battery_change_date"], now, now))
+    if site_id is not None:
+        conn.execute("INSERT INTO kg_site_map (serial_number, site_id) VALUES (?, ?) "
+                     "ON CONFLICT(serial_number) DO UPDATE SET site_id = excluded.site_id", (serial, site_id))
+    if state:
+        conn.execute("INSERT INTO kg_state_log (kg_id, at, old_state, new_state) VALUES (?, ?, NULL, ?)",
+                     (cur.lastrowid, now, state))
+    log_activity("add_manual_kg", f"KG {serial} ({v['device_type']}) added by hand", conn=conn)
+    return serial
+
+
+def update_manual_kg(conn, serial_number: str, device_type: str, site_id: int = None, system_name: str = None,
+                     pt_ip: str = None, ct_ip: str = None, new_serial_number: str = None, state: str = None,
+                     software_version: str = None, ffvs_exp_date: str = None,
+                     battery_change_date: str = None) -> str:
+    """Rewrites every editable field of a hand-entered KG (blank = empty) and
+    returns its serial, which changes if new_serial_number is given. GEM One
+    units cannot be edited here (their data belongs to the pull)."""
+    row, v, final_serial = _kg_manual_validate(conn, device_type, site_id, pt_ip, ct_ip, ffvs_exp_date,
+                                               battery_change_date, new_serial_number, editing_serial=serial_number)
+    serial = row["serial_number"]
+    actual_site = site_id if site_id is not None else get_or_create_unassigned_site(conn)
+    state = _kg_clean(state)
+    conn.execute(
+        "UPDATE kg_devices SET serial_number = ?, site_id = ?, system_name = ?, device_type = ?, state = ?, "
+        "software_version = ?, pt_ip = ?, ct_ip = ?, ffvs_exp_date = ?, battery_change_date = ?, last_seen = ? "
+        "WHERE id = ?",
+        (final_serial, actual_site, _kg_clean(system_name), v["device_type"], state, _kg_clean(software_version),
+         v["pt_ip"], v["ct_ip"], v["ffvs_exp_date"], v["battery_change_date"], _now(), row["id"]))
+    conn.execute("DELETE FROM kg_site_map WHERE serial_number = ?", (serial,))
+    if site_id is not None:
+        conn.execute("INSERT INTO kg_site_map (serial_number, site_id) VALUES (?, ?) "
+                     "ON CONFLICT(serial_number) DO UPDATE SET site_id = excluded.site_id", (final_serial, site_id))
+    if (row["state"] or None) != state:
+        conn.execute("INSERT INTO kg_state_log (kg_id, at, old_state, new_state) VALUES (?, ?, ?, ?)",
+                     (row["id"], _now(), row["state"], state))
+    log_activity("edit_manual_kg", f"KG {serial} edited" + (f", serial now {final_serial}" if final_serial != serial else ""),
+                 conn=conn)
+    return final_serial
 
 
 def get_kg_devices(conn, site_id: int = None, include_deleted: bool = False):
