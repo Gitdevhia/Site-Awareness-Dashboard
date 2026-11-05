@@ -2395,7 +2395,6 @@ class CommandRunnerTab(ttk.Frame):
             return
         fingerprint = self._plugin_fingerprint()
         if fingerprint != getattr(self, "_plugin_fingerprint_seen", None):
-            self._plugin_fingerprint_seen = fingerprint
             previous_id = self._selected_plugin_id()
             previous_params = {name: var.get() for name, (var, _req) in self._param_vars.items()}
 
@@ -2414,6 +2413,10 @@ class CommandRunnerTab(ttk.Frame):
                 for name, value in previous_params.items():
                     if name in self._param_vars:
                         self._param_vars[name][0].set(value)
+            # Recorded only after the rebuild finished, so a failure
+            # partway through is retried on the next tab switch instead
+            # of being treated as already done.
+            self._plugin_fingerprint_seen = fingerprint
         self._refresh_site_choices()
 
     def _bind_wheel(self, widget):

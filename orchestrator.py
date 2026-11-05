@@ -35,6 +35,7 @@ import sys
 import os
 import re
 import importlib
+import importlib.util
 import argparse
 import datetime
 import threading
@@ -1406,6 +1407,15 @@ def list_plugins() -> dict:
             # Re-read from disk on every scan: import_module() alone
             # returns the cached module, so edits to a plugin would
             # otherwise never show up until the app was relaunched.
+            # Python trusts a cached .pyc whose recorded source mtime
+            # (whole seconds) and size match, so an edit made in the
+            # same second as the previous save with the same length
+            # would be read back stale. Dropping the .pyc forces a
+            # fresh compile from the source.
+            try:
+                os.remove(importlib.util.cache_from_source(os.path.join(PLUGINS_DIR, fname)))
+            except OSError:
+                pass
             if mod_name in sys.modules:
                 module = importlib.reload(sys.modules[mod_name])
             else:
