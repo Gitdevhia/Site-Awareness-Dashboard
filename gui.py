@@ -2392,22 +2392,14 @@ class CommandRunnerTab(ttk.Frame):
         alone so a valid preview isn't thrown away for nothing. Skipped
         entirely while a run is in flight."""
         if self._run_in_progress():
-            _refresh_debug("Command Runner: skipped, a run is in progress")  # TEMP
             return
         fingerprint = self._plugin_fingerprint()
-        _refresh_debug(f"Command Runner: scanning {orchestrator.PLUGINS_DIR}; "
-              f"{len(fingerprint)} plugin files; changed since last scan: "
-              f"{fingerprint != getattr(self, '_plugin_fingerprint_seen', None)}")  # TEMP
-        _seen = getattr(self, "_plugin_fingerprint_seen", None)  # TEMP
-        _refresh_debug("Command Runner: files now  : " + ", ".join(f"{n}@{m:.3f}" for n, m in fingerprint))  # TEMP
-        _refresh_debug("Command Runner: last seen  : " + (", ".join(f"{n}@{m:.3f}" for n, m in _seen) if _seen is not None else "(none yet)"))  # TEMP
         if fingerprint != getattr(self, "_plugin_fingerprint_seen", None):
             previous_id = self._selected_plugin_id()
             previous_params = {name: var.get() for name, (var, _req) in self._param_vars.items()}
 
             self._plugins = orchestrator.list_plugins()
             self._plugin_ids = sorted(self._plugins)
-            _refresh_debug(f"Command Runner: loaded plugins {self._plugin_ids}")  # TEMP
             self.plugin_list.delete(0, "end")
             for pid in self._plugin_ids:
                 module = self._plugins[pid]
@@ -2425,7 +2417,6 @@ class CommandRunnerTab(ttk.Frame):
             # partway through is retried on the next tab switch instead
             # of being treated as already done.
             self._plugin_fingerprint_seen = fingerprint
-            _refresh_debug("Command Runner: plugin list rebuilt and fingerprint recorded")  # TEMP
         self._refresh_site_choices()
 
     def _bind_wheel(self, widget):
@@ -3203,19 +3194,6 @@ class CredentialsTab(ttk.Frame):
         db.log_activity("delete_credential_type", f"Deleted '{type_name}'")
 
 
-def _refresh_debug(msg: str):  # TEMP
-    """Temporary: appends to refresh_debug.log next to gui.py (and prints),
-    so it works even when the app is launched without a console."""
-    line = f"[refresh debug] {msg}"
-    print(line)
-    try:
-        import datetime
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "refresh_debug.log"), "a", encoding="utf-8") as f:
-            f.write(f"{datetime.datetime.now():%H:%M:%S} {line}\n")
-    except Exception:
-        pass
-
-
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -3262,48 +3240,15 @@ class App(tk.Tk):
         # write_queue.py's module docstring for the full design.
         self._drain_in_progress = False
         self._schedule_periodic_drain()
-        _refresh_debug(f"app started from {os.path.abspath(__file__)}")  # TEMP
-        _refresh_debug(f"NotebookTabChanged bindings on notebook: {notebook.bind('<<NotebookTabChanged>>')!r}")  # TEMP
-        # Backup for the event above: if Tk doesn't deliver
-        # <<NotebookTabChanged>> for any reason, notice the selection
-        # change by polling and run the same handler.
-        # Make sure the handler's prerequisites exist even if an earlier
-        # part of this setup is missing from a merged copy of this file.
-        self.notebook = notebook
-        if not notebook.bind("<<NotebookTabChanged>>"):
-            notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-            _refresh_debug("NotebookTabChanged binding was missing; attached it")  # TEMP
-        self._last_tab = notebook.select()
-        self._poll_ticks = 0
-        self.after(250, self._poll_selected_tab)
-        _refresh_debug("build poll-backup-v3: tab poller started; selected = " + repr(self._last_tab))  # TEMP
-
-    def _poll_selected_tab(self):
-        try:
-            current = self.notebook.select()
-            self._poll_ticks += 1
-            if self._poll_ticks in (1, 20, 80):  # TEMP: proves the poller is alive (~0.25s, 5s, 20s)
-                _refresh_debug(f"poller tick {self._poll_ticks}; selected = {current!r}")
-            if current != self._last_tab:
-                _refresh_debug(f"poll noticed a tab change the event did not report: {current!r}")  # TEMP
-                self._on_tab_changed()
-        except Exception as e:
-            _refresh_debug(f"tab poll error: {e}")  # TEMP
-        self.after(250, self._poll_selected_tab)
 
     def _on_tab_changed(self, event=None):
-        self._last_tab = self.notebook.select()
-        _refresh_debug(f"<<NotebookTabChanged>> handler running; selected = {self._last_tab!r}")  # TEMP
         try:
             tab = self.nametowidget(self.notebook.select())
             refresh = getattr(tab, "refresh", None)
-            _refresh_debug(f"tab switched to {type(tab).__name__}; has refresh(): {callable(refresh)}")  # TEMP
             if callable(refresh):
                 refresh()
         except Exception as e:
             # A failed refresh must never break tab switching.
-            import traceback
-            _refresh_debug(f"could not refresh tab: {e}\n{traceback.format_exc()}")  # TEMP: also goes to the log
             print(f"Warning: could not refresh tab: {e}")
 
     # --- background write-queue draining ---
