@@ -3259,17 +3259,21 @@ class App(tk.Tk):
         self._drain_in_progress = False
         self._schedule_periodic_drain()
         _refresh_debug(f"app started from {os.path.abspath(__file__)}")  # TEMP
+        _refresh_debug(f"NotebookTabChanged bindings on notebook: {notebook.bind('<<NotebookTabChanged>>')!r}")  # TEMP
 
     def _on_tab_changed(self, event=None):
-        tab = self.nametowidget(self.notebook.select())
-        refresh = getattr(tab, "refresh", None)
-        _refresh_debug(f"tab switched to {type(tab).__name__}; has refresh(): {callable(refresh)}")  # TEMP
-        if callable(refresh):
-            try:
+        _refresh_debug(f"<<NotebookTabChanged>> fired; selected = {self.notebook.select()!r}")  # TEMP
+        try:
+            tab = self.nametowidget(self.notebook.select())
+            refresh = getattr(tab, "refresh", None)
+            _refresh_debug(f"tab switched to {type(tab).__name__}; has refresh(): {callable(refresh)}")  # TEMP
+            if callable(refresh):
                 refresh()
-            except Exception as e:
-                # A failed refresh must never break tab switching.
-                print(f"Warning: could not refresh tab: {e}")
+        except Exception as e:
+            # A failed refresh must never break tab switching.
+            import traceback
+            _refresh_debug(f"could not refresh tab: {e}\n{traceback.format_exc()}")  # TEMP: also goes to the log
+            print(f"Warning: could not refresh tab: {e}")
 
     # --- background write-queue draining ---
 
