@@ -2392,14 +2392,19 @@ class CommandRunnerTab(ttk.Frame):
         alone so a valid preview isn't thrown away for nothing. Skipped
         entirely while a run is in flight."""
         if self._run_in_progress():
+            print("[refresh debug] Command Runner: skipped, a run is in progress")  # TEMP
             return
         fingerprint = self._plugin_fingerprint()
+        print(f"[refresh debug] Command Runner: scanning {orchestrator.PLUGINS_DIR}; "
+              f"{len(fingerprint)} plugin files; changed since last scan: "
+              f"{fingerprint != getattr(self, '_plugin_fingerprint_seen', None)}")  # TEMP
         if fingerprint != getattr(self, "_plugin_fingerprint_seen", None):
             previous_id = self._selected_plugin_id()
             previous_params = {name: var.get() for name, (var, _req) in self._param_vars.items()}
 
             self._plugins = orchestrator.list_plugins()
             self._plugin_ids = sorted(self._plugins)
+            print(f"[refresh debug] Command Runner: loaded plugins {self._plugin_ids}")  # TEMP
             self.plugin_list.delete(0, "end")
             for pid in self._plugin_ids:
                 module = self._plugins[pid]
@@ -3244,6 +3249,7 @@ class App(tk.Tk):
     def _on_tab_changed(self, event=None):
         tab = self.nametowidget(self.notebook.select())
         refresh = getattr(tab, "refresh", None)
+        print(f"[refresh debug] tab switched to {type(tab).__name__}; has refresh(): {callable(refresh)}")  # TEMP
         if callable(refresh):
             try:
                 refresh()
