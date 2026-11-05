@@ -12,7 +12,11 @@ Two sub-tabs:
                   "Import file only" and "Check file" for a file that is
                   already on disk.
   KG devices      every KG with its health, and a way to assign KGs to
-                  sites (by hand, or from the serial-to-site CSV).
+                  sites (by hand, or from the serial-to-site CSV). Also Add KG
+                  and Edit selected, for units GEM One cannot see (a TACLANE or
+                  ViaSat that works but is not in the pull): a short form, only
+                  the type is required, and the unit then shows up by name in
+                  the security-association tables instead of "not in SAD".
 
 All checking and importing is done by gemone_import.py (run_import /
 run_map), the same code the command line uses, so there is one
@@ -125,6 +129,150 @@ class _SiteChoiceDialog(tk.Toplevel):
         self.destroy()
 
 
+class _KgFormDialog(tk.Toplevel):
+    """Modal form to add or edit a hand-entered KG.
+
+    on_save(values) -> (serial, error). While it returns an error the form
+    stays open and shows the message. self.saved counts successful saves.
+    Only the type is required; a PT or CT IP is what lets the security-
+    association tables recognize the unit, so the form says so."""
+
+    def __init__(self, parent, sites, types, states, on_save, kg=None):
+        super().__init__(parent)
+        self.saved = 0
+        self._on_save = on_save
+        self._sites = sites
+        self._editing = kg is not None
+        self.title("Edit KG" if self._editing else "Add KG")
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+        self.vars = {k: tk.StringVar() for k in ("type", "site", "name", "pt_ip", "ct_ip", "serial",
+                                                 "state", "software", "keymat", "battery")}
+        r = 0
+
+        def row(label, widget):
+            nonlocal r
+            ttk.Label(body, text=label).grid(row=r, column=0, sticky="w", padx=(0, 10), pady=3)
+            widget.grid(row=r, column=1, sticky="ew", pady=3)
+            r += 1
+
+        self.type_combo = ttk.Combobox(body, textvariable=self.vars["type"], values=types, state="readonly", width=34)
+        row("Type *", self.type_combo)
+        site_values = ["Unassigned"] + [f"{s['site_octet']}  -  {s['site_name'] or '(unset)'}" for s in sites]
+        self.site_combo = ttk.Combobox(body, textvariable=self.vars["site"], values=site_values, state="readonly", width=34)
+        row("Site", self.site_combo)
+        row("Name", ttk.Entry(body, textvariable=self.vars["name"], width=36))
+        row("PT IP", ttk.Entry(body, textvariable=self.vars["pt_ip"], width=36))
+        row("CT IP", ttk.Entry(body, textvariable=self.vars["ct_ip"], width=36))
+        row("Serial" if self._editing else "Serial (optional)", ttk.Entry(body, textvariable=self.vars["serial"], width=36))
+        hint = ("A PT or CT IP is what links this unit to the security associations that point at it. "
+                "Without one it cannot be matched. Leave Name blank to show the serial."
+                if not self._editing else
+                "Enter the real serial here if you learn it. When GEM One later lists that serial, it takes this unit over.")
+        ttk.Label(body, text=hint, foreground="#555555", wraplength=380, justify="left").grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=(4, 6))
+        r += 1
+        if not self._editing:
+            ttk.Label(body, text="Leave Serial blank to generate one, for example ViaSat-1.",
+                      foreground="#555555", wraplength=380).grid(row=r, column=0, columnspan=2, sticky="w")
+            r += 1
+
+        self._more_open = False
+        self.more_button = ttk.Button(body, text="More details (optional)  >", command=self._toggle_more)
+        self.more_button.grid(row=r, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        r += 1
+        self.more = ttk.Frame(body)
+        self.more.columnconfigure(1, weight=1)
+        for i, (label, key, widget_kind) in enumerate((("State", "state", "combo"), ("Software", "software", "entry"),
+                                                      ("KEYMAT expires (YYYY-MM-DD)", "keymat", "entry"),
+                                                      ("Battery changed (YYYY-MM-DD)", "battery", "entry"))):
+            ttk.Label(self.more, text=label).grid(row=i, column=0, sticky="w", padx=(0, 10), pady=3)
+            if widget_kind == "combo":
+                w = ttk.Combobox(self.more, textvariable=self.vars[key], values=[""] + list(states), width=34)
+            else:
+                w = ttk.Entry(self.more, textvariable=self.vars[key], width=36)
+            w.grid(row=i, column=1, sticky="ew", pady=3)
+        self._more_row = r
+        r += 1
+
+        self.message = ttk.Label(body, text="", foreground="#c62828", wraplength=380, justify="left")
+        self.message.grid(row=r, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        r += 1
+        buttons = ttk.Frame(body)
+        buttons.grid(row=r, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right", padx=(6, 0))
+        if not self._editing:
+            ttk.Button(buttons, text="Save and add another", command=lambda: self._save(True)).pack(side="right", padx=(6, 0))
+        ttk.Button(buttons, text="Save", command=lambda: self._save(False)).pack(side="right")
+
+        if kg is not None:
+            self._fill(kg)
+        else:
+            self.site_combo.current(0)     # Unassigned; the type is left blank so it is a deliberate choice
+        self.update_idletasks()
+        try:
+            x = parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_reqwidth()) // 2)
+            y = parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_reqheight()) // 3)
+            self.geometry(f"+{x}+{y}")
+        except tk.TclError:
+            pass
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.wait_window(self)
+
+    def _toggle_more(self):
+        self._more_open = not self._more_open
+        if self._more_open:
+            self.more.grid(row=self._more_row, column=0, columnspan=2, sticky="ew")
+            self.more_button.configure(text="More details (optional)  v")
+        else:
+            self.more.grid_remove()
+            self.more_button.configure(text="More details (optional)  >")
+
+    def _fill(self, kg):
+        self.vars["type"].set(kg.get("device_type") or "")
+        site = kg.get("site_octet")
+        index = 0
+        for i, s in enumerate(self._sites):
+            if s["site_octet"] == site and site != "unassigned":
+                index = i + 1
+        self.site_combo.current(index)
+        for key, col in (("name", "system_name"), ("pt_ip", "pt_ip"), ("ct_ip", "ct_ip"), ("serial", "serial_number"),
+                         ("state", "state"), ("software", "software_version"), ("keymat", "ffvs_exp_date"),
+                         ("battery", "battery_change_date")):
+            self.vars[key].set(kg.get(col) or "")
+        if any(self.vars[k].get() for k in ("state", "software", "keymat", "battery")):
+            self._toggle_more()
+
+    def _values(self):
+        v = {k: var.get().strip() for k, var in self.vars.items()}
+        i = self.site_combo.current()
+        v["site_id"] = self._sites[i - 1]["id"] if i > 0 else None
+        return v
+
+    def _save(self, another):
+        values = self._values()
+        if not values["type"]:
+            self.message.configure(text="Choose a type.", foreground="#c62828")
+            return
+        serial, error = self._on_save(values)
+        if error:
+            self.message.configure(text=error, foreground="#c62828")
+            return
+        self.saved += 1
+        if another:
+            for key in ("name", "pt_ip", "ct_ip", "serial", "state", "software", "keymat", "battery"):
+                self.vars[key].set("")
+            self.message.configure(text=f"Saved {serial}. Add the next one.", foreground="#1b5e20")
+        else:
+            self.destroy()
+
+
 class GemOneTab(ttk.Frame):
     def __init__(self, parent, creds):
         super().__init__(parent)
@@ -223,8 +371,12 @@ class GemOneTab(ttk.Frame):
         page.rowconfigure(1, weight=1)
         bar = ttk.Frame(page, padding=10)
         bar.grid(row=0, column=0, sticky="ew")
+        self.add_button = ttk.Button(bar, text="Add KG...", command=self._on_add_kg)
+        self.add_button.pack(side="left")
+        self.edit_button = ttk.Button(bar, text="Edit selected...", command=self._on_edit_kg, state="disabled")
+        self.edit_button.pack(side="left", padx=(6, 0))
         self.assign_button = ttk.Button(bar, text="Assign selected to site...", command=self._on_assign, state="disabled")
-        self.assign_button.pack(side="left")
+        self.assign_button.pack(side="left", padx=(6, 0))
         self.remove_button = ttk.Button(bar, text="Remove selected...", command=self._on_remove, state="disabled")
         self.remove_button.pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="Load site map CSV...", command=self._on_load_map).pack(side="left", padx=(6, 0))
@@ -236,11 +388,11 @@ class GemOneTab(ttk.Frame):
         frame.grid(row=1, column=0, sticky="nsew")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
-        cols = ("name", "serial", "site", "state", "keymat", "health", "note")
+        cols = ("name", "serial", "site", "state", "keymat", "health", "source", "note")
         self.kg_tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
         for col, text, width in (("name", "Name", 170), ("serial", "Serial", 130), ("site", "Site", 150),
                                  ("state", "State", 110), ("keymat", "KEYMAT", 110), ("health", "Health", 80),
-                                 ("note", "Note", 150)):
+                                 ("source", "Source", 80), ("note", "Note", 150)):
             self.kg_tree.heading(col, text=text)
             self.kg_tree.column(col, width=width, anchor="w")
         self.kg_tree.grid(row=0, column=0, sticky="nsew")
@@ -294,6 +446,10 @@ class GemOneTab(ttk.Frame):
         if busy:
             self.assign_button.configure(state="disabled")
             self.remove_button.configure(state="disabled")
+            self.edit_button.configure(state="disabled")
+            self.add_button.configure(state="disabled")
+        else:
+            self.add_button.configure(state="normal")
 
     def _clear_log(self):
         self.log.configure(state="normal")
@@ -574,18 +730,26 @@ class GemOneTab(ttk.Frame):
             days = ev["keymat_days"]
             keymat = "-" if days is None else ("expired" if days < 0 else f"{days} days")
             note = "not in latest file" if k["missing_since"] else ("last pull failed" if k["last_error"] else "")
+            source = "Manual" if k.get("source") == "manual" else "GEM One"
             self.kg_tree.insert("", "end", iid=k["serial_number"], tags=(ev["health"],), values=(
-                k["system_name"] or "-", k["serial_number"], site_text, k["state"] or "unknown", keymat, ev["health"], note))
+                k["system_name"] or "-", k["serial_number"], site_text, k["state"] or "unknown", keymat, ev["health"],
+                source, note))
             self._kg_rows[k["serial_number"]] = k
         text = f"{len(rows)} KG(s)"
         if unassigned:
             text += f", {unassigned} with no site"
         self.kg_count_label.configure(text=text)
+        self._on_kg_selection()
 
     def _on_kg_selection(self, event=None):
-        state = "normal" if self.kg_tree.selection() and not self._is_busy() else "disabled"
+        selected = self.kg_tree.selection()
+        state = "normal" if selected and not self._is_busy() else "disabled"
         self.assign_button.configure(state=state)
         self.remove_button.configure(state=state)
+        editable = (len(selected) == 1 and not self._is_busy()
+                    and self._kg_rows.get(selected[0], {}).get("source") == "manual")
+        self.edit_button.configure(state="normal" if editable else "disabled")
+        self.add_button.configure(state="disabled" if self._is_busy() else "normal")
 
     def _on_remove(self):
         serials = list(self.kg_tree.selection())
@@ -594,10 +758,15 @@ class GemOneTab(ttk.Frame):
         names = "\n".join(f"  {self._kg_rows[s]['system_name'] or '-'}  ({s})" for s in serials[:10])
         if len(serials) > 10:
             names += f"\n  ... and {len(serials) - 10} more"
-        if not messagebox.askyesno(
-                "Remove KGs",
-                f"Remove {len(serials)} KG(s) from SAD?\n\n{names}\n\n"
-                "They disappear from the dashboard. If a later GEM One file lists one again, it comes back by itself."):
+        manual = [s for s in serials if self._kg_rows[s].get("source") == "manual"]
+        if len(manual) == len(serials):
+            tail = "They disappear from the dashboard and do not come back by themselves."
+        elif manual:
+            tail = ("They disappear from the dashboard. A GEM One unit comes back by itself if a later file lists it "
+                    "again; a hand-entered one does not.")
+        else:
+            tail = "They disappear from the dashboard. If a later GEM One file lists one again, it comes back by itself."
+        if not messagebox.askyesno("Remove KGs", f"Remove {len(serials)} KG(s) from SAD?\n\n{names}\n\n{tail}"):
             return
         failed = []
         for serial in serials:
@@ -638,6 +807,97 @@ class GemOneTab(ttk.Frame):
             messagebox.showerror("Assign to site", "Some assignments failed:\n\n" + "\n".join(failed[:10]))
         else:
             messagebox.showinfo("Assign to site", "Saved. Regenerate the dashboard to see it on the site pages.")
+
+    def _known_types(self):
+        """Every type already in the data, plus ViaSat (and any manual_kg_types from settings.json)."""
+        found = {}
+        try:
+            with db.get_conn() as conn:
+                for r in conn.execute("SELECT DISTINCT device_type FROM kg_devices WHERE device_type IS NOT NULL"):
+                    t = (r[0] or "").strip()
+                    if t:
+                        found.setdefault(t.lower(), t)
+        except Exception:
+            pass
+        extra = self._cfg(quiet=True).get("manual_kg_types") or []
+        for t in ["ViaSat"] + [str(x).strip() for x in extra if str(x).strip()]:
+            found.setdefault(t.lower(), t)
+        return sorted(found.values(), key=str.lower)
+
+    def _form_sites(self):
+        with db.get_conn() as conn:
+            sites = list(db.get_all_sites(conn))
+        return [s for s in sites if s["site_octet"] != "unassigned"]
+
+    def _open_form(self, kg=None):
+        try:
+            sites = self._form_sites()
+        except Exception as e:
+            messagebox.showerror("KG", f"Could not read the sites: {e}")
+            return
+        states = list((self._cfg(quiet=True).get("state_health") or {}).keys())
+        editing_serial = kg["serial_number"] if kg else None
+
+        def on_save(values):
+            kwargs = dict(device_type=values["type"], site_id=values["site_id"], system_name=values["name"],
+                          pt_ip=values["pt_ip"], ct_ip=values["ct_ip"], state=values["state"],
+                          software_version=values["software"], ffvs_exp_date=values["keymat"],
+                          battery_change_date=values["battery"])
+            # Check first, so a mistake in the form never reaches the write queue
+            # (a queued write that fails is kept there and retried on every drain).
+            try:
+                with db.get_conn() as conn:
+                    problem = db.check_manual_kg(
+                        conn, values["type"], site_id=values["site_id"], pt_ip=values["pt_ip"], ct_ip=values["ct_ip"],
+                        ffvs_exp_date=values["keymat"], battery_change_date=values["battery"],
+                        serial_number=values["serial"], editing_serial=editing_serial)
+            except Exception as e:
+                return None, f"Could not check the entry: {e}"
+            if problem:
+                return None, problem
+            try:
+                if editing_serial:
+                    serial = write_queue.queue_and_wait("update_manual_kg", timeout=30, serial_number=editing_serial,
+                                                        new_serial_number=values["serial"], **kwargs)
+                else:
+                    serial = write_queue.queue_and_wait("add_manual_kg", timeout=30,
+                                                        serial_number=values["serial"], **kwargs)
+            except (RuntimeError, TimeoutError) as e:
+                return None, self._clean_error(e)
+            self.refresh_kgs()
+            return serial, None
+
+        dialog = _KgFormDialog(self, sites, self._known_types(), states, on_save, kg=kg)
+        if dialog.saved:
+            self._offer_rebuild()
+
+    @staticmethod
+    def _clean_error(e) -> str:
+        """The plain message from a queued write that raised ValueError."""
+        text = str(e).strip()
+        for prefix in ("ValueError:", "ValueError("):
+            if prefix in text:
+                text = text.split(prefix, 1)[1].strip().strip("()'\"")
+        return text or "The save failed."
+
+    def _offer_rebuild(self):
+        if messagebox.askyesno("Dashboard", "Saved. Rebuild the dashboard now so the pages show it?"):
+            self.inner.select(0)     # the log lives on the Pull & import page
+            self._begin(self._rebuild_dashboard)
+
+    def _on_add_kg(self):
+        if not self._is_busy():
+            self._open_form()
+
+    def _on_edit_kg(self):
+        selected = self.kg_tree.selection()
+        if self._is_busy() or len(selected) != 1:
+            return
+        kg = self._kg_rows.get(selected[0])
+        if kg is None or kg.get("source") != "manual":
+            messagebox.showinfo("Edit KG", "Only units entered by hand can be edited. GEM One units are updated by the pull.")
+            return
+        self._open_form(kg)
 
     def _on_load_map(self):
         cfg = self._cfg()

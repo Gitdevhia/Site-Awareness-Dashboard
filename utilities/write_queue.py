@@ -171,6 +171,8 @@ ACTIONS = {
     "set_kg_site": db.set_kg_site,
     "import_kg_site_map": db.import_kg_site_map,
     "soft_delete_kg_device": db.soft_delete_kg_device,
+    "add_manual_kg": db.add_manual_kg,
+    "update_manual_kg": db.update_manual_kg,
 }
 
 

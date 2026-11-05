@@ -28,6 +28,9 @@ DEFAULTS = {
         "interface_down_health": "critical",
         "unreachable_pairs_warn": False,
         "data_stale_after_days": 2,
+        # Extra choices for the Add KG type list (it already offers every type
+        # found in the data, plus ViaSat).
+        "manual_kg_types": [],
     },
     "command_runner": {
         "max_workers": 24,
