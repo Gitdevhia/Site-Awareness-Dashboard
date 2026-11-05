@@ -168,8 +168,17 @@ def _freshness(conn, cfg):
             + (" - older than expected, run the GEM One pull" if stale else "")), ("kg-c-warn" if stale else "kg-c-dim")
 
 
+def _is_manual(k) -> bool:
+    return k.get("source") == "manual"
+
+
+_MANUAL_TITLE = "Entered by hand. This unit is not read by GEM One."
+
+
 def _flags(k, cfg) -> str:
     out = []
+    if _is_manual(k):
+        out.append(f'<span class="kg-pill dashed" title="{_MANUAL_TITLE}">manual</span>')
     if k["missing_since"]:
         out.append(f'<span class="kg-pill dashed" title="Not in the latest GEM One file since {_esc(k["missing_since"])}">not in latest file</span>')
     if k["last_error"]:
@@ -185,7 +194,9 @@ def _summary_row(k, cfg) -> str:
     bt = (f'<span class="kg-mono">{_esc(k["battery_change_date"])}</span> <span class="{_TXT[ev["battery_health"]]}">&middot; {ev["battery_years"]} yr</span>'
           if k["battery_change_date"] else '<span class="kg-c-dim">-</span>')
     total, bad = k["assoc_total"], k["assoc_unreachable"]
-    if not total:
+    if not total and _is_manual(k):
+        sa = '<span class="kg-c-dim">-</span>'
+    elif not total:
         sa = '0 <span class="kg-c-dim">&middot; none</span>'
     elif bad:
         sa = f'{total} <span class="kg-c-warn">&middot; {bad} unreachable</span>'
@@ -241,7 +252,8 @@ def _assoc_html(conn, k, peers) -> str:
     for i, r in enumerate(rows):
         peer = peers.get(r["remote_ct"]) or peers.get(r["remote_pt"])
         if peer is not None and peer["id"] != k["id"]:
-            peer_html = f'<a href="{_site_href(peer)}">{_esc(_name(peer))}</a> <span class="kg-c-dim">&middot; site {_esc(peer["site_octet"] or "?")}</span>'
+            manual_tag = f' <span class="kg-pill dashed" title="{_MANUAL_TITLE}">manual</span>' if _is_manual(peer) else ""
+            peer_html = f'<a href="{_site_href(peer)}">{_esc(_name(peer))}</a> <span class="kg-c-dim">&middot; site {_esc(peer["site_octet"] or "?")}</span>{manual_tag}'
         else:
             peer_html = '<span class="kg-c-dim">not in SAD</span>'
         reach = r["pair_reachable"]
@@ -265,6 +277,17 @@ def _device_block(conn, k, cfg, peers) -> str:
     why = ("Needs attention: " + "; ".join(ev["reasons"])) if ev["reasons"] else "No problems found by the current thresholds."
     if k["last_error"]:
         why += f" Last pull failed: {k['last_error']}."
+    if _is_manual(k):
+        why = ("Entered by hand, so there is no GEM One data for it. "
+               + (("Needs attention: " + "; ".join(ev["reasons"])) if ev["reasons"] else
+                  "Health shows as unknown until a state or dates are filled in (Edit on the KG devices tab in SAD)."
+                  if ev["health"] == "unknown" else "No problems found by the current thresholds."))
+    if _is_manual(k):
+        data_card = (f'<div class="kg-card"><div class="t">Source</div><div class="v">Manual entry</div>'
+                     f'<div class="s">added {_fmt_ts(k["first_seen"])}</div></div>')
+    else:
+        data_card = (f'<div class="kg-card"><div class="t">GEM One data</div><div class="v">{_fmt_ts(k["data_collected_at"])}</div>'
+                     f'<div class="s">first seen {_fmt_ts(k["first_seen"])}</div></div>')
     return f'''
     <details class="kg h-{ev['health']}" id="kg-{_slug(k['serial_number'])}">
       <summary>{_summary_row(k, cfg)}</summary>
@@ -274,7 +297,7 @@ def _device_block(conn, k, cfg, peers) -> str:
           {_iface_card("PT Interface", k["pt_ip"], k["pt_mac"], k["pt_status"])}
           {_iface_card("CT Interface", k["ct_ip"], k["ct_mac"], k["ct_status"])}
           <div class="kg-card"><div class="t">Software</div><div class="v">{_esc(k["software_version"] or "-")}</div><div class="s">{_esc(k["device_type"] or "")}</div></div>
-          <div class="kg-card"><div class="t">GEM One data</div><div class="v">{_fmt_ts(k["data_collected_at"])}</div><div class="s">first seen {_fmt_ts(k["first_seen"])}</div></div>
+          {data_card}
         </div>
         {_assoc_html(conn, k, peers)}
       </div>
@@ -344,6 +367,7 @@ def render_kg_fleet_page(conn) -> str:
     warn_days = cfg.get("keymat_warn_days") or 0
     expiring = sum(1 for k in kgs if k["ev"]["keymat_days"] is not None and k["ev"]["keymat_days"] <= warn_days)
     unassigned = sum(1 for k in kgs if (k["site_octet"] or "unassigned") == "unassigned")
+    manual_count = sum(1 for k in kgs if _is_manual(k))
     kgs.sort(key=lambda k: (k["ev"]["keymat_days"] is None, k["ev"]["keymat_days"] if k["ev"]["keymat_days"] is not None else 0, _name(k).lower()))
     fresh, fresh_cls = _freshness(conn, cfg)
     rows = []
@@ -355,7 +379,9 @@ def render_kg_fleet_page(conn) -> str:
         bt = (f'<span class="kg-mono">{ev["battery_years"]} yr</span>' if k["battery_change_date"] else '<span class="kg-c-dim">-</span>')
         total_sa = k["assoc_total"]
         ok_sa = reachable.get(k["id"], 0)
-        if not total_sa:
+        if not total_sa and _is_manual(k):
+            sa_cell = '<span class="kg-c-dim">-</span>'
+        elif not total_sa:
             sa_cell = '<span class="kg-c-dim">no SAs</span>'
         else:
             sa_cell = f'<span class="{"kg-c-warn" if k["assoc_unreachable"] else ""}">{ok_sa} of {total_sa} SAs</span>'
@@ -377,7 +403,7 @@ def render_kg_fleet_page(conn) -> str:
         <div class="kg-col"><div class="kg-lbl">KEYMAT</div>{km}</div>
         <div class="kg-col"><div class="kg-lbl">Battery age</div>{bt}</div>
         <div class="kg-col"><div class="kg-lbl">Reachable</div>{sa_cell}</div>
-        <div class="badges">{''.join(f'<span class="badge reason">{f}</span>' for f in flags)}</div>
+        <div class="badges">{''.join(f'<span class="badge reason">{f}</span>' for f in flags)}{'<span class="badge" title="' + _MANUAL_TITLE + '">manual</span>' if _is_manual(k) else ""}</div>
       </a>''')
     body = "".join(rows) if rows else '<p class="empty">No KG devices have been imported yet.</p>'
     generated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -436,7 +462,7 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
   <header>
     <div>
       <h1>KG Devices</h1>
-      <div class="subtitle">{len(kgs)} KG(s) · generated {generated_at}</div>
+      <div class="subtitle">{len(kgs)} KG(s){f" ({manual_count} entered by hand)" if manual_count else ""} · generated {generated_at}</div>
     </div>
     <button class="icon-btn" id="theme-toggle" title="Toggle theme">\U0001F319</button>
   </header>
