@@ -655,6 +655,10 @@ class SiteManagerTab(ttk.Frame):
 
     # --- data population ---
 
+    def refresh(self):
+        """Called by App each time this tab is switched to."""
+        self.refresh_sites()
+
     def refresh_sites(self):
         previously_selected_id = self.selected_site["id"] if self.selected_site else None
         for row in self.site_tree.get_children():
@@ -1654,14 +1658,20 @@ class DiscoveryTab(ttk.Frame):
         self.collect_tunnels_check.configure(state="normal" if collect_tunnels_relevant else "disabled")
         self.config_stale_check.configure(state="normal" if self.action_var.get() == "configs" else "disabled")
 
+    def refresh(self):
+        """Called by App each time this tab is switched to."""
+        self._refresh_site_choices()
+
     def _refresh_site_choices(self):
+        idx = self.site_combo.current()
+        previous_id = self._site_keys[idx] if 0 <= idx < len(self._site_keys) else None
         with db.get_conn() as conn:
             sites = db.get_all_sites(conn)
         self._site_keys = [site["id"] for site in sites]
         display_values = [f"{site['site_name'] or site['site_octet']} ({site['site_octet']})" for site in sites]
         self.site_combo["values"] = display_values
         if display_values:
-            self.site_combo.current(0)
+            self.site_combo.current(self._site_keys.index(previous_id) if previous_id in self._site_keys else 0)
 
     def _append_console(self, text: str):
         self.console.configure(state="normal")
@@ -2359,6 +2369,55 @@ class CommandRunnerTab(ttk.Frame):
         else:
             self._update_plugin_shape_widgets()
             self._invalidate_preview()
+
+    @staticmethod
+    def _plugin_fingerprint():
+        """(filename, mtime) for every plugin file - cheap way to tell
+        whether anything in utilities/plugins/ changed since last scan."""
+        items = []
+        try:
+            for fname in sorted(os.listdir(orchestrator.PLUGINS_DIR)):
+                if fname.endswith(".py") and not fname.startswith("_"):
+                    items.append((fname, os.path.getmtime(os.path.join(orchestrator.PLUGINS_DIR, fname))))
+        except OSError:
+            pass
+        return tuple(items)
+
+    def refresh(self):
+        """Called by App each time this tab is switched to. Picks up
+        plugin files that were added, edited or removed (list_plugins()
+        reloads edited modules from disk) and any site changes, keeping
+        the selected plugin, typed parameter values and scope where they
+        still apply. If no plugin file changed, the plugin side is left
+        alone so a valid preview isn't thrown away for nothing. Skipped
+        entirely while a run is in flight."""
+        if self._run_in_progress():
+            return
+        fingerprint = self._plugin_fingerprint()
+        if fingerprint != getattr(self, "_plugin_fingerprint_seen", None):
+            previous_id = self._selected_plugin_id()
+            previous_params = {name: var.get() for name, (var, _req) in self._param_vars.items()}
+
+            self._plugins = orchestrator.list_plugins()
+            self._plugin_ids = sorted(self._plugins)
+            self.plugin_list.delete(0, "end")
+            for pid in self._plugin_ids:
+                module = self._plugins[pid]
+                suffix = "  (standalone)" if orchestrator.is_standalone_plugin(module) else ""
+                self.plugin_list.insert("end", f"{module.NAME}{suffix}")
+            if self._plugin_ids:
+                idx = self._plugin_ids.index(previous_id) if previous_id in self._plugin_ids else 0
+                self.plugin_list.selection_set(idx)
+            self._on_plugin_changed()  # rebuilds the parameter fields from the fresh PARAMS
+            if previous_id is not None and previous_id == self._selected_plugin_id():
+                for name, value in previous_params.items():
+                    if name in self._param_vars:
+                        self._param_vars[name][0].set(value)
+            # Recorded only after the rebuild finished, so a failure
+            # partway through is retried on the next tab switch instead
+            # of being treated as already done.
+            self._plugin_fingerprint_seen = fingerprint
+        self._refresh_site_choices()
 
     def _bind_wheel(self, widget):
         widget.bind("<MouseWheel>", lambda e: self._check_canvas.yview_scroll(int(-e.delta / 120), "units"))
@@ -3154,6 +3213,7 @@ class App(tk.Tk):
         login_path, self.creds, master_password = login.result
 
         notebook = ttk.Notebook(self)
+        self.notebook = notebook
         notebook.pack(fill="both", expand=True)
 
         self.site_manager_tab = SiteManagerTab(notebook)
@@ -3164,6 +3224,13 @@ class App(tk.Tk):
         notebook.add(gemone_tab.GemOneTab(notebook, self.creds), text="GEM One")
         notebook.add(CredentialsTab(notebook, login_path, self.creds, master_password), text="Credentials")
 
+        # Re-load a tab's data each time it's switched to, so changes made
+        # elsewhere (a plugin file edited on disk, sites changed from
+        # another tab or another person's GUI) show up without having to
+        # close and relaunch. Bound after every tab is added so it doesn't
+        # fire during startup. Tabs opt in by defining refresh().
+        notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
         # Keeps the shared write queue moving even when this GUI is
         # just sitting open with nobody clicking anything - without
         # this, an item someone else queued (or one of this app's own
@@ -3173,6 +3240,16 @@ class App(tk.Tk):
         # write_queue.py's module docstring for the full design.
         self._drain_in_progress = False
         self._schedule_periodic_drain()
+
+    def _on_tab_changed(self, event=None):
+        try:
+            tab = self.nametowidget(self.notebook.select())
+            refresh = getattr(tab, "refresh", None)
+            if callable(refresh):
+                refresh()
+        except Exception as e:
+            # A failed refresh must never break tab switching.
+            print(f"Warning: could not refresh tab: {e}")
 
     # --- background write-queue draining ---
 

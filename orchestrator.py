@@ -34,7 +34,8 @@ utilities/credential_manager.py) with a 'tacacs' credential (username
 import sys
 import os
 import re
-import importlib
+import importlib  # list_plugins(): load, reload and invalidate caches for plugin modules
+import importlib.util  # list_plugins(): cache_from_source() finds a plugin's cached .pyc; a bare "import importlib" doesn't guarantee this submodule
 import argparse
 import datetime
 import threading
@@ -1397,12 +1398,28 @@ def list_plugins() -> dict:
         return plugins
     if PLUGINS_DIR not in sys.path:
         sys.path.insert(0, PLUGINS_DIR)
+    importlib.invalidate_caches()  # NEW PLUGINS: Python caches folder listings; without this a plugin file added after startup isn't found
     for fname in sorted(os.listdir(PLUGINS_DIR)):
         if not fname.endswith(".py") or fname.startswith("_"):
             continue
         mod_name = fname[:-3]
         try:
-            module = importlib.import_module(mod_name)
+            # Re-read from disk on every scan: import_module() alone
+            # returns the cached module, so edits to a plugin would
+            # otherwise never show up until the app was relaunched.
+            # Python trusts a cached .pyc whose recorded source mtime
+            # (whole seconds) and size match, so an edit made in the
+            # same second as the previous save with the same length
+            # would be read back stale. Dropping the .pyc forces a
+            # fresh compile from the source.
+            try:
+                os.remove(importlib.util.cache_from_source(os.path.join(PLUGINS_DIR, fname)))  # SAME-SECOND EDITS: delete the stale .pyc so the source is recompiled
+            except OSError:
+                pass
+            if mod_name in sys.modules:
+                module = importlib.reload(sys.modules[mod_name])  # EDITED PLUGINS: already loaded, so re-read the file from disk (import_module would return the old cached copy)
+            else:
+                module = importlib.import_module(mod_name)  # NEW PLUGINS: first time this file has been seen, so a normal import
             has_core = all(hasattr(module, attr) for attr in ("NAME", "DESCRIPTION", "PARAMS"))
             has_plan = hasattr(module, "plan")
             has_run = hasattr(module, "run")
