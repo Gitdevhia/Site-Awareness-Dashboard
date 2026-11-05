@@ -2398,6 +2398,9 @@ class CommandRunnerTab(ttk.Frame):
         _refresh_debug(f"Command Runner: scanning {orchestrator.PLUGINS_DIR}; "
               f"{len(fingerprint)} plugin files; changed since last scan: "
               f"{fingerprint != getattr(self, '_plugin_fingerprint_seen', None)}")  # TEMP
+        _seen = getattr(self, "_plugin_fingerprint_seen", None)  # TEMP
+        _refresh_debug("Command Runner: files now  : " + ", ".join(f"{n}@{m:.3f}" for n, m in fingerprint))  # TEMP
+        _refresh_debug("Command Runner: last seen  : " + (", ".join(f"{n}@{m:.3f}" for n, m in _seen) if _seen is not None else "(none yet)"))  # TEMP
         if fingerprint != getattr(self, "_plugin_fingerprint_seen", None):
             previous_id = self._selected_plugin_id()
             previous_params = {name: var.get() for name, (var, _req) in self._param_vars.items()}
@@ -2422,6 +2425,7 @@ class CommandRunnerTab(ttk.Frame):
             # partway through is retried on the next tab switch instead
             # of being treated as already done.
             self._plugin_fingerprint_seen = fingerprint
+            _refresh_debug("Command Runner: plugin list rebuilt and fingerprint recorded")  # TEMP
         self._refresh_site_choices()
 
     def _bind_wheel(self, widget):
