@@ -52,6 +52,7 @@ import vrf_parser  # noqa: E402
 import mac_parser  # noqa: E402
 import tunnel_parser  # noqa: E402
 import config_parser  # noqa: E402
+import aci_collect  # noqa: E402
 
 
 # How many sites run_for_sites() will scan at once. Bounded rather than
@@ -1195,6 +1196,17 @@ def collect_configs(site_row, creds: dict, open_session_fn=None, session_log_dir
     )
 
 
+def collect_aci(site, creds, progress_cb=None, slot=None) -> None:
+    """ACI action (phase 0 probe): pull the APIC config for this site if one is configured."""
+    octet = site["site_octet"]
+
+    def say(msg):
+        print(f"[{octet}] {msg}")
+        _report_progress(progress_cb, "status", octet, slot, "skipped" if msg.startswith("skipped") else "walking", msg)
+    user, password = _get_tacacs_credentials(creds)
+    aci_collect.run_site(octet, user, password, say)
+
+
 def _run_site_actions(site, actions: list, creds: dict, session_log_dir: str = None,
                        collect_mac_tables: bool = False, collect_tunnels_flag: bool = False,
                        progress_cb=None, worker_slots=None, config_include_stale: bool = False) -> None:
@@ -1237,6 +1249,9 @@ def _run_site_actions(site, actions: list, creds: dict, session_log_dir: str = N
     if collect_tunnels_flag:
         print("--- Tunnel collection ---")
         collect_tunnels(site, creds, session_log_dir=session_log_dir, progress_cb=progress_cb, slot=slot)
+    if "aci" in actions:
+        print("--- ACI collection ---")
+        collect_aci(site, creds, progress_cb=progress_cb, slot=slot)
     if "configs" in actions:
         print("--- Config collection ---")
         collect_configs(site, creds, session_log_dir=session_log_dir, progress_cb=progress_cb, slot=slot,
@@ -1778,7 +1793,7 @@ def run_cli(argv: list) -> None:
     group.add_argument("--site", metavar="KEY", help="Run against one site (matches octet, name, or code)")
     group.add_argument("--all", action="store_true", help="Run against every site in the database")
     parser.add_argument(
-        "--action", choices=["cdp", "arp", "all", "configs"], required=True,
+        "--action", choices=["cdp", "arp", "all", "configs", "aci"], required=True,
         help="Which action to run: cdp discovery, arp collection, all (cdp + arp), or configs (pull running-configs "
              "from devices already in the database; no CDP walk). 'all' does not include configs.",
     )
@@ -1834,8 +1849,9 @@ def run_menu() -> None:
     print("(2) Run ARP collection")
     print("(3) Run both (CDP then ARP)")
     print("(4) Collect running-configs (devices already in the database)")
+    print("(5) Collect ACI config (APIC probe; sites listed in settings.json 'aci')")
     choice = input("Select action: ").strip()
-    action_map = {"1": ["cdp"], "2": ["arp"], "3": ["cdp", "arp"], "4": ["configs"]}
+    action_map = {"1": ["cdp"], "2": ["arp"], "3": ["cdp", "arp"], "4": ["configs"], "5": ["aci"]}
     actions = action_map.get(choice)
     if actions is None:
         print("Invalid choice.")

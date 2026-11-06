@@ -32,6 +32,17 @@ DEFAULTS = {
         # found in the data, plus ViaSat).
         "manual_kg_types": [],
     },
+    "aci": {
+        # {site_octet: [apic1, apic2, apic3]} - tried in order. Example: {"20": ["apic1.example", "apic2.example"]}
+        "sites": {},
+        "login_domain": "",
+        "verify": False,  # False | True | "path/to/ca.pem". False prints one warning per run.
+        "timeout_seconds": 600,
+        "config_query": "/api/mo/uni.json?rsp-subtree=full&rsp-prop-include=config-only",
+        "operational_classes": ["fabricNode", "fabricExplicitGEp", "fabricPathEp", "lldpAdjEp", "cdpAdjEp"],
+        "probe_output_dir": "aci_probe_output",
+        "probe_repeat": True,  # pull uni twice to check the hash is stable
+    },
     "command_runner": {
         "max_workers": 24,
         "per_site_limit": 5,
