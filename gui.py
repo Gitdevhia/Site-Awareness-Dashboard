@@ -51,6 +51,7 @@ import dashboard_generate  # noqa: E402
 import kg_pages  # noqa: E402
 import gemone_tab  # noqa: E402
 import config_viewer  # noqa: E402
+import aci_pages  # noqa: E402
 import csv_export  # noqa: E402
 import write_queue  # noqa: E402
 import settings_loader  # noqa: E402
@@ -1890,8 +1891,10 @@ class DiscoveryTab(ttk.Frame):
                 dashboard_generate.generate_all()
                 with db.get_conn() as conn:
                     cfg = config_viewer.generate_config_pages(conn)
+                    aci = aci_pages.generate_aci_pages(conn)
                 print(f"  Wrote config viewer: {cfg['devices']} device(s), {cfg['written']} rebuilt, "
                       f"{cfg['skipped']} unchanged")
+                print(f"  Wrote ACI explorer: {aci['sites']} site(s), {aci['written']} rebuilt, {aci['skipped']} unchanged")
             else:
                 with db.get_conn() as conn:
                     # Looked up by primary key, same reasoning as
@@ -1929,6 +1932,7 @@ class DiscoveryTab(ttk.Frame):
                         # device index is always refreshed.
                         cfg = config_viewer.generate_config_pages(conn, site_id=site["id"])
                         print(f"  Wrote config viewer: {cfg['written']} device file(s) rebuilt for this site")
+                        aci_pages.generate_aci_pages(conn)
         except Exception as e:
             print(f"ERROR: {e}")
         finally:

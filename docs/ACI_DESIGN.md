@@ -1,6 +1,6 @@
 # ACI Dashboard - Design (draft)
 
-Status: phase 0 probe built (`utilities/aci_collect.py`); rest is design. Branch: `feature/ACI`.
+Status: phases 0-1 built (collector, raw store, graph, explorer, override/anchor data model). Phases 2-4 are design. Not yet run against a real APIC. Branch: `feature/ACI`.
 
 ## 1. Goal
 
@@ -62,7 +62,7 @@ Decision: ACI tables live in `sad.db`, and every write goes through the existing
 
 ## 9. Tables (sketch, in `sad.db`)
 
-`aci_raw` (site_id, query, fetched_at, content_hash, payload_z, size_bytes), `aci_anchors` (site_id, cluster, role, dn, source, created_by, created_at), `aci_overrides` (site_id, dn, kind, value_json, action, created_by, created_at), and in phase 3 `aci_endpoints` and `aci_endpoint_moves`. Last-pull time comes from the newest `aci_raw` row; errors go to the activity log. Generic design means a new view needs no schema change.
+`aci_raw` (site_id, query, fetched_at, content_hash, payload_z, size_bytes), `aci_anchors` (site_id, cluster, role, dn, source, created_by, created_at), `aci_overrides` (site_id, dn, kind `attr|entity|edge`, key, value_json, action `set|add|hide`, created_by, created_at), and in phase 3 `aci_endpoints` and `aci_endpoint_moves`. Last-pull time comes from the newest `aci_raw` row; errors go to the activity log. Generic design means a new view needs no schema change.
 
 ## 10. Integration (files and edits)
 
@@ -99,3 +99,12 @@ Manual runs mean first/last seen reflect pulls, not real time; APIC timestamps s
 ## 14. Open items
 
 DNS scope (endpoint IPs only or LLDP/CDP names too), where endpoint search lives (own page or merged with Search Clients), ESG/contract detail depth, and Prism integration (kept possible by using generic "compute cluster/node" entities with a `platform` attribute and external IDs).
+
+## 15. Phase 1 as built
+
+- `ACI action` (`--action aci`, menu option 5): one pull per site, stored through the queue (`aci_save_raw_pull`); identical pulls are skipped. The GUI Discovery tab has no ACI button yet.
+- `utilities/aci_db.py`: tables, queue actions (`aci_set_anchor`, `aci_set_override`, `aci_purge_raw`, ...), readers. Any process that should drain ACI items must import it.
+- `utilities/aci_graph.py`: relation objects (`...Rs...`) stay entities (they carry encap/mode) and also give an edge parent -> `tDn`. Targets missing from the pull show as "(not in pull)".
+- `aci_pages.py` + `aci_template.html` -> `dashboard/aci.html`, `dashboard/aci/`. Run by "Generate dashboard" or `python3 aci_pages.py`. Search is per selected site, all words must match class, name or DN.
+- Overrides and anchors are applied when pages are generated; there is no editor yet (phase 2 tab). Until then use the queue actions.
+- Purge: `aci_db.purge_raw(conn, "YYYY-MM-DD")` keeps each query's first and newest pull.

@@ -1197,14 +1197,14 @@ def collect_configs(site_row, creds: dict, open_session_fn=None, session_log_dir
 
 
 def collect_aci(site, creds, progress_cb=None, slot=None) -> None:
-    """ACI action (phase 0 probe): pull the APIC config for this site if one is configured."""
+    """ACI action: pull the APIC config for this site (if one is configured) and store it."""
     octet = site["site_octet"]
 
     def say(msg):
         print(f"[{octet}] {msg}")
         _report_progress(progress_cb, "status", octet, slot, "skipped" if msg.startswith("skipped") else "walking", msg)
     user, password = _get_tacacs_credentials(creds)
-    aci_collect.run_site(octet, user, password, say)
+    aci_collect.run_site(octet, site["id"], user, password, say)
 
 
 def _run_site_actions(site, actions: list, creds: dict, session_log_dir: str = None,

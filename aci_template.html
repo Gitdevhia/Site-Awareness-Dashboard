@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ACI Explorer &mdash; Site Awareness Dashboard</title>
+<style>
+__CSS_TOKENS__
+body{ margin:0; background:var(--bg); color:var(--text); font-family:var(--sans); }
+.wrap{ max-width:1500px; margin:0 auto; padding:24px; }
+a{ color:var(--accent); cursor:pointer; text-decoration:none; } a:hover{ text-decoration:underline; }
+button, select, input{ font-family:var(--sans); font-size:13px; color:var(--text); }
+button{ background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:7px 12px; cursor:pointer; }
+button:hover{ border-color:var(--accent); }
+select, input{ background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:7px 10px; }
+input:focus, select:focus{ outline:none; border-color:var(--accent); }
+.icon-btn{ width:38px; height:38px; padding:0; font-size:16px; }
+header{ display:flex; justify-content:space-between; align-items:flex-start; padding-bottom:16px; border-bottom:1px solid var(--border); margin-bottom:18px; }
+h1{ font-size:22px; margin:0 0 4px; } h2{ font-size:15px; margin:18px 0 8px; color:var(--accent); }
+.subtitle, .dim{ font-family:var(--mono); font-size:12px; color:var(--text-dim); }
+.backlink{ display:inline-block; font-family:var(--mono); font-size:12px; color:var(--text-dim); border:1px solid var(--border); border-radius:999px; padding:5px 12px; margin-bottom:14px; }
+.bar{ display:flex; gap:8px; margin-bottom:14px; } .bar input{ flex:1; }
+.panes{ display:grid; grid-template-columns:minmax(260px,420px) 1fr; gap:16px; align-items:start; }
+.pane{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:12px 14px; min-width:0; }
+#results{ max-height:75vh; overflow:auto; font-family:var(--mono); font-size:12px; }
+.res{ padding:3px 4px; border-radius:4px; cursor:pointer; word-break:break-all; } .res:hover{ background:var(--panel-2); }
+.res .cls{ color:var(--text-dim); margin-right:6px; }
+table.attrs{ border-collapse:collapse; font-family:var(--mono); font-size:12px; width:100%; }
+table.attrs td{ padding:2px 8px 2px 0; vertical-align:top; word-break:break-all; border-bottom:1px solid var(--border); }
+table.attrs td:first-child{ color:var(--text-dim); white-space:nowrap; width:1%; }
+.tag{ font-family:var(--mono); font-size:10px; border:1px solid var(--accent); color:var(--accent); border-radius:999px; padding:0 6px; margin-left:6px; }
+.kid{ margin:2px 0 2px 16px; border-left:1px solid var(--border); padding-left:10px; font-family:var(--mono); font-size:12px; }
+.kid > .row{ cursor:pointer; padding:1px 0; word-break:break-all; } .kid > .row:hover{ background:var(--panel-2); }
+.crumbs{ font-family:var(--mono); font-size:12px; word-break:break-all; margin-bottom:10px; }
+.rel{ font-family:var(--mono); font-size:12px; margin:2px 0; word-break:break-all; }
+@media (max-width:900px){ .panes{ grid-template-columns:1fr; } }
+__BANNER_CSS__
+</style>
+</head>
+<body>
+__BANNER__
+<div class="wrap">
+  <a class="backlink" href="index.html">&larr; Dashboard</a>
+  <header>
+    <div><h1>ACI Explorer</h1><div class="subtitle" id="gen"></div></div>
+    <button id="theme-toggle" class="icon-btn" title="Toggle theme"></button>
+  </header>
+  <div class="bar">
+    <select id="site"></select>
+    <input id="q" type="search" placeholder="Search class, name or DN (all words must match), e.g.  aaep ntnx1" autofocus>
+  </div>
+  <div class="panes">
+    <section class="pane"><div class="dim" id="count"></div><div id="results"></div></section>
+    <section class="pane" id="detail"><div class="dim">Pick a site, then search or open a root object.</div></section>
+  </div>
+</div>
+<script>
+(function(){
+var $ = function(id){ return document.getElementById(id); };
+function h(tag, props, kids){
+  var e = document.createElement(tag);
+  for (var k in (props||{})) { if (k === "text") e.textContent = props[k]; else if (k === "click") e.onclick = props[k]; else e.setAttribute(k, props[k]); }
+  (kids||[]).forEach(function(c){ if (c) e.appendChild(c); });
+  return e;
+}
+var site = null, loaded = {};
+var crcT = []; for (var n = 0; n < 256; n++){ var c = n; for (var k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; crcT[n] = c >>> 0; }
+function crc32(s){ var c = 0xFFFFFFFF; for (var i = 0; i < s.length; i++) c = crcT[(c ^ s.charCodeAt(i)) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function load(url, cb){
+  if (loaded[url]) return cb();
+  var s = document.createElement("script"); s.src = url;
+  s.onload = function(){ loaded[url] = 1; cb(); };
+  s.onerror = function(){ $("detail").textContent = "Could not load " + url; };
+  document.head.appendChild(s);
+}
+function detail(dn, cb){
+  var idx = ACI_I[site], f = site + "_" + (crc32(dn) % idx.shards);
+  load("aci/" + f + ".js", function(){ cb((ACI_D[site] || {})[dn] || {c: "", a: {}}); });
+}
+function lbl(dn){ var p = dn.split("/"); return p[p.length - 1]; }
+
+/* ---- search ---- */
+function search(){
+  if (!site) return;
+  var terms = $("q").value.toLowerCase().split(/\s+/).filter(Boolean), out = $("results"), shown = 0, total = 0;
+  out.textContent = "";
+  var ents = ACI_I[site].ents;
+  for (var i = 0; i < ents.length; i++){
+    var e = ents[i];
+    if (terms.length){
+      var blob = (e[1] + " " + e[2] + " " + e[0]).toLowerCase(), ok = true;
+      for (var t = 0; t < terms.length; t++) if (blob.indexOf(terms[t]) < 0) { ok = false; break; }
+      if (!ok) continue;
+    } else if (e[0].indexOf("/") >= 0) continue;   /* no query: show roots only */
+    total++;
+    if (shown < 200){ shown++; out.appendChild(res(e)); }
+  }
+  $("count").textContent = total + " match" + (total === 1 ? "" : "es") + (total > shown ? " (showing first " + shown + ")" : "");
+}
+function res(e){
+  return h("div", {"class": "res", title: e[0], click: function(){ show(e[0]); }},
+    [h("span", {"class": "cls", text: e[1] || "(not in pull)"}), h("span", {text: e[2]})]);
+}
+
+/* ---- details ---- */
+function attrTable(d){
+  var t = h("table", {"class": "attrs"}), keys = Object.keys(d.a || {}).sort();
+  keys.forEach(function(k){
+    var manual = (d.m || []).indexOf(k) >= 0;
+    t.appendChild(h("tr", {}, [h("td", {text: k}), h("td", {text: String(d.a[k])}, manual ? [h("span", {"class": "tag", text: "manual"})] : [])]));
+  });
+  return t;
+}
+function dnLink(dn){ return h("a", {text: dn, click: function(){ show(dn); }}); }
+function show(dn){
+  location.hash = "#" + site + "|" + encodeURIComponent(dn);
+  detail(dn, function(d){
+    var box = $("detail"); box.textContent = "";
+    var parts = [], cur = "", segs = dn.split(/\/(?![^\[]*\])/);
+    var crumbs = h("div", {"class": "crumbs"});
+    segs.forEach(function(s, i){
+      cur = cur ? cur + "/" + s : s;
+      var target = cur;
+      crumbs.appendChild(i < segs.length - 1 ? h("a", {text: s, click: function(){ show(target); }}) : h("b", {text: s}));
+      if (i < segs.length - 1) crumbs.appendChild(document.createTextNode(" / "));
+    });
+    box.appendChild(crumbs);
+    box.appendChild(h("div", {}, [h("b", {text: d.c || "(referenced, not in pull)"})].concat((d.t || []).map(function(t){
+      return h("span", {"class": "tag", text: "anchor: " + t[0] + " " + t[1] + (t[2] === "manual" ? " (manual)" : "")}); }),
+      (d.m || []).indexOf("hidden") >= 0 ? [h("span", {"class": "tag", text: "hidden (manual)"})] : [])));
+    if (d.a && Object.keys(d.a).length) box.appendChild(attrTable(d));
+    if ((d.o || []).length){
+      box.appendChild(h("h2", {text: "Points to (" + d.o.length + ")"}));
+      d.o.forEach(function(r){ box.appendChild(h("div", {"class": "rel"}, [h("span", {"class": "dim", text: r[0] + " → "}), dnLink(r[1])])); });
+    }
+    if ((d.i || []).length){
+      box.appendChild(h("h2", {text: "Referenced by (" + d.i.length + ")"}));
+      d.i.forEach(function(r){ box.appendChild(h("div", {"class": "rel"}, [h("span", {"class": "dim", text: r[0] + " ← "}), dnLink(r[1])])); });
+    }
+    if ((d.k || []).length){
+      box.appendChild(h("h2", {text: "Children (" + d.k.length + ")"}));
+      d.k.slice().sort().forEach(function(k){ box.appendChild(kid(k)); });
+    }
+  });
+}
+function kid(dn){
+  var wrap = h("div", {"class": "kid"}), body = h("div"), open = false;
+  var row = h("div", {"class": "row", title: dn, click: function(){
+    open = !open; body.textContent = "";
+    if (open) detail(dn, function(d){
+      body.appendChild(attrTable(d));
+      body.appendChild(h("div", {"class": "rel"}, [h("a", {text: "open page", click: function(){ show(dn); }})]));
+      (d.k || []).slice().sort().forEach(function(k){ body.appendChild(kid(k)); });
+    });
+  }}, [h("span", {text: lbl(dn)})]);
+  wrap.appendChild(row); wrap.appendChild(body);
+  detail(dn, function(d){ row.insertBefore(h("span", {"class": "dim", text: (d.c || "?") + "  "}), row.firstChild); });
+  return wrap;
+}
+
+/* ---- startup ---- */
+function pickSite(o){
+  site = o;
+  load("aci/" + o + "_index.js", function(){ search(); var m = location.hash.slice(1).split("|"); if (m[0] === o && m[1]) show(decodeURIComponent(m[1])); });
+}
+load("aci/sites.js", function(){
+  $("gen").textContent = "Generated " + ACI_GENERATED;
+  var sel = $("site");
+  (ACI_SITES || []).forEach(function(s){
+    var newest = Object.keys(s.at).map(function(k){ return s.at[k]; }).sort().pop() || "?";
+    sel.appendChild(h("option", {value: s.o, text: s.o + (s.n ? " – " + s.n : "") + "  (pulled " + newest + " UTC)"}));
+  });
+  if (!ACI_SITES.length) $("detail").textContent = "No ACI pulls stored yet. Run the ACI action, then generate the dashboard.";
+  sel.onchange = function(){ pickSite(sel.value); };
+  var want = location.hash.slice(1).split("|")[0];
+  if (want) sel.value = want;
+  if (sel.value) pickSite(sel.value);
+});
+var tm; $("q").oninput = function(){ clearTimeout(tm); tm = setTimeout(search, 150); };
+
+/* ---- theme ---- */
+var root = document.documentElement, btn = $("theme-toggle");
+function paint(t){ btn.textContent = t === "dark" ? "☀" : "☾"; }
+var saved = null; try { saved = localStorage.getItem("sad-theme"); } catch(e) {}
+if (saved) root.setAttribute("data-theme", saved);
+paint(root.getAttribute("data-theme"));
+btn.onclick = function(){ var n = root.getAttribute("data-theme") === "dark" ? "light" : "dark"; root.setAttribute("data-theme", n); try { localStorage.setItem("sad-theme", n); } catch(e) {} paint(n); };
+})();
+</script>
+</body>
+</html>

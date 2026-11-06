@@ -1,7 +1,9 @@
-"""aci_collect.py (v0.1, phase 0 probe) - pull the Cisco ACI config from an APIC.
+"""aci_collect.py (v1.0) - pull the Cisco ACI config from an APIC and store it in sad.db.
 
-Phase 0 only saves what it pulled to files and writes a small, masked "shape
-report" that can be carried out by hand. Nothing is written to sad.db yet.
+Each pull (the whole-uni config plus operational classes) goes to the write queue as one
+item (action aci_save_raw_pull); a pull identical to the newest stored one is not stored
+again. A small masked "shape report" (counts, attribute names, masked samples) is also
+written to aci_probe_output/ so it can be carried out by hand if needed.
 
 Per site (settings.json -> "aci" -> "sites" -> {site_octet: [apic1, apic2, apic3]}):
   APICs are tried in list order. An APIC is skipped on a connect/login failure;
@@ -24,7 +26,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import settings_loader  # noqa: E402
 
-VERSION = "0.1"
+VERSION = "1.0"
 _VOLATILE = {"modTs", "lcOwn", "childAction", "monPolDn", "uid", "dn_ts"}  # stripped before hashing
 _MASK_KEYS = {"sysName", "sysDesc", "mgmtIp", "chassisIdV", "portIdV", "devId", "ip", "addr", "mac",
               "descr", "nameAlias", "annotation", "serial", "oobMgmtAddr", "inbMgmtAddr", "pwd"}
@@ -121,8 +123,15 @@ def _shape(imdata):
                 "samples": [_mask(a) for a in s["samples"]]} for c, s in sorted(stats.items())}
 
 
-def probe_site(octet, apics, user, password, cfg=None, say=print):
-    """Pull the whole config + operational classes from one site; save raw + shape report."""
+def _queue_store(site_id, pulls):
+    import write_queue
+    import aci_db  # noqa: F401  (registers the ACI queue actions)
+    return write_queue.queue_and_wait("aci_save_raw_pull", timeout=600, site_id=site_id, pulls=pulls)
+
+
+def probe_site(octet, apics, user, password, cfg=None, say=print, site_id=None, store=_queue_store):
+    """Pull the whole config + operational classes from one site; store the raw pull (if site_id
+    is given) and write the shape report. store(site_id, pulls) is replaceable for tests."""
     cfg = cfg or _cfg()
     timeout = cfg["timeout_seconds"]
     out_dir = settings_loader.resolve_path(cfg["probe_output_dir"])
@@ -131,7 +140,7 @@ def probe_site(octet, apics, user, password, cfg=None, say=print):
     s, base = connect(apics, user, password, cfg, say)
     report = {"probe_version": VERSION, "site": octet, "apic": "(masked)",
               "queries": {}, "created": stamp}
-    raw = {}
+    packed = []
     queries = {"uni": cfg["config_query"]}
     queries.update({c: f"/api/class/{c}.json" for c in cfg["operational_classes"]})
     for name, path in queries.items():
@@ -139,7 +148,8 @@ def probe_site(octet, apics, user, password, cfg=None, say=print):
         try:
             data, secs, size = _get(s, base, path, timeout)
             imdata = data.get("imdata", [])
-            raw[name] = imdata
+            import aci_db
+            packed.append({"query": name, "hash": _hash(imdata), "payload": aci_db.pack(imdata), "size": size})
             q = {"seconds": round(secs, 1), "bytes": size, "objects_top": len(imdata), "hash": _hash(imdata)}
             if name == "uni":
                 q["top_level_children"] = sorted({c for o in imdata for b in o.values()
@@ -153,24 +163,24 @@ def probe_site(octet, apics, user, password, cfg=None, say=print):
         except Exception as e:  # one failed query must not lose the others
             report["queries"][name] = {"error": f"{type(e).__name__}: {e}"}
             say(f"query {name} failed: {type(e).__name__}")
-    raw_path = os.path.join(out_dir, f"raw_{octet}_{stamp}.json.gz")
-    with gzip.open(raw_path, "wt", encoding="utf-8") as f:
-        json.dump(raw, f)
+    if site_id is not None and packed:
+        res = store(site_id, packed)
+        say(f"stored raw pull: {res}")
     rep_path = os.path.join(out_dir, f"shape_report_{octet}_{stamp}.json")
     with open(rep_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=1)
-    say(f"saved {os.path.basename(raw_path)} and {os.path.basename(rep_path)} in {out_dir}")
+    say(f"shape report: {rep_path}")
     return rep_path
 
 
-def run_site(octet, user, password, say=print):
+def run_site(octet, site_id, user, password, say=print):
     """Orchestrator entry: returns False (skipped) if the site has no APIC configured."""
     cfg = _cfg()
     apics = cfg["sites"].get(str(octet))
     if not apics:
         say("skipped: no APIC configured for this site")
         return False
-    probe_site(str(octet), apics, user, password, cfg, say)
+    probe_site(str(octet), apics, user, password, cfg, say, site_id=site_id)
     return True
 
 
@@ -238,5 +248,8 @@ if __name__ == "__main__":
     else:
         import getpass
         user = sys.argv[sys.argv.index("--user") + 1] if "--user" in sys.argv else input("APIC user: ")
-        if not run_site(sys.argv[1], user, getpass.getpass("APIC password: ")):
+        import db
+        with db.get_conn() as c:
+            site = db.find_site_by_any_key(c, sys.argv[1])
+        if not site or not run_site(site["site_octet"], site["id"], user, getpass.getpass("APIC password: ")):
             sys.exit(1)

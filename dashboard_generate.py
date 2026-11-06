@@ -1059,6 +1059,7 @@ footer{{ margin-top:20px; font-family:var(--mono); font-size:11px; color:var(--t
       <a class="btn" href="clients.html">Search Clients</a>
       <a class="btn" href="exports.html">Exports</a>
       <a class="btn" href="configs.html">Configs</a>
+      <a class="btn" href="aci.html">ACI</a>
       {kg_button_html}
       <a class="btn" href="site-unassigned.html">Unassigned ({unassigned_count})</a>
       <button class="icon-btn" id="theme-toggle" title="Toggle theme">\U0001F319</button>
