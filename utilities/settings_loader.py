@@ -42,6 +42,7 @@ DEFAULTS = {
         "operational_classes": ["fabricNode", "fabricExplicitGEp", "fabricPathEp", "lldpAdjEp", "cdpAdjEp"],
         "probe_output_dir": "aci_probe_output",
         "probe_repeat": True,  # pull uni twice to check the hash is stable
+        "debug": False,  # True: print a full traceback when a query fails
     },
     "command_runner": {
         "max_workers": 24,

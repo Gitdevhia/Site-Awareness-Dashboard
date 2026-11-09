@@ -72,7 +72,7 @@ def connect(apics, user, password, cfg, say=print):
             return s, base
         except Exception as e:  # connect/login failure -> next APIC
             errors.append(f"{apic}: {type(e).__name__}: {e}")
-            say(f"APIC {apic} unavailable ({type(e).__name__}), trying next")
+            say(f"APIC {apic} unavailable ({type(e).__name__}: {e}), trying next")
     raise ConnectionError("no APIC usable - " + "; ".join(errors))
 
 
@@ -151,6 +151,7 @@ def probe_site(octet, apics, user, password, cfg=None, say=print, site_id=None, 
             import aci_db
             packed.append({"query": name, "hash": _hash(imdata), "payload": aci_db.pack(imdata), "size": size})
             q = {"seconds": round(secs, 1), "bytes": size, "objects_top": len(imdata), "hash": _hash(imdata)}
+            say(f"pulled {name}: {len(imdata)} top object(s), {size / 1e6:.1f} MB, {secs:.1f}s")
             if name == "uni":
                 q["top_level_children"] = sorted({c for o in imdata for b in o.values()
                                                   for k in b.get("children", []) for c in k})
@@ -162,7 +163,10 @@ def probe_site(octet, apics, user, password, cfg=None, say=print, site_id=None, 
             report["queries"][name] = q
         except Exception as e:  # one failed query must not lose the others
             report["queries"][name] = {"error": f"{type(e).__name__}: {e}"}
-            say(f"query {name} failed: {type(e).__name__}")
+            say(f"query {name} failed: {type(e).__name__}: {e}")
+            if cfg.get("debug"):
+                import traceback
+                say(traceback.format_exc())
     if site_id is not None and packed:
         res = store(site_id, packed)
         say(f"stored raw pull: {res}")

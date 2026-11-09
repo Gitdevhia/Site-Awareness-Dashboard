@@ -108,3 +108,4 @@ DNS scope (endpoint IPs only or LLDP/CDP names too), where endpoint search lives
 - `aci_pages.py` + `aci_template.html` -> `dashboard/aci.html`, `dashboard/aci/`. Run by "Generate dashboard" or `python3 aci_pages.py`. Search is per selected site, all words must match class, name or DN.
 - Overrides and anchors are applied when pages are generated; there is no editor yet (phase 2 tab). Until then use the queue actions.
 - Purge: `aci_db.purge_raw(conn, "YYYY-MM-DD")` keeps each query's first and newest pull.
+- Output and debugging: each query prints `pulled <name>: N top object(s), X MB, Ts`; failures print `Type: message`. Set `aci.debug` to `true` in `settings.json` to also print a full traceback for a failed query. `python utilities/aci_collect.py --selftest` checks a hand-copied file against a fake APIC (run it with the same Python used for the orchestrator).
