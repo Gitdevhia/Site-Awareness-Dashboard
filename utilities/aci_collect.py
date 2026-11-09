@@ -79,7 +79,8 @@ def connect(apics, user, password, cfg, say=print):
 def _get(s, base, path, timeout):
     t0 = time.time()
     r = s.get(base + path, timeout=timeout)
-    r.raise_for_status()
+    if r.status_code >= 400:  # the APIC explains itself in the body; raise_for_status() drops that
+        raise RuntimeError(f"HTTP {r.status_code} for {path}: {r.text[:300]}")
     return r.json(), time.time() - t0, len(r.content)
 
 
