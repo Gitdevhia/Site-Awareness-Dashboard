@@ -1,8 +1,10 @@
 """aci_collect.py (v1.0) - pull the Cisco ACI config from an APIC and store it in sad.db.
 
-Each pull (the whole-uni config plus operational classes) goes to the write queue as one
-item (action aci_save_raw_pull); a pull identical to the newest stored one is not stored
-again. A small masked "shape report" (counts, attribute names, masked samples) is also
+The config is pulled in pieces with all properties (the APIC refuses a full-property subtree
+on uni itself): uni, then every child of uni (access policies, each tenant, fabric, domains...)
+as its own query, then the operational classes. Pulls go to the write queue (action
+aci_save_raw_pull) in size-bounded items; a query identical to its newest stored pull is not
+stored again. A "_run" row lists the queries of each run, so older query names are ignored. A small masked "shape report" (counts, attribute names, masked samples) is also
 written to aci_probe_output/ so it can be carried out by hand if needed.
 
 Per site (settings.json -> "aci" -> "sites" -> {site_octet: [apic1, apic2, apic3]}):
@@ -13,7 +15,7 @@ Read-only: only GET requests (plus the login POST).
 Run alone against one site:  python utilities/aci_collect.py 20 [--user NAME]
 Self-test (fake APIC):       python utilities/aci_collect.py --selftest
 """
-import gzip
+import collections
 import hashlib
 import json
 import os
@@ -26,7 +28,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import settings_loader  # noqa: E402
 
-VERSION = "1.0"
+VERSION = "2.0"
 _VOLATILE = {"modTs", "lcOwn", "childAction", "monPolDn", "uid", "dn_ts"}  # stripped before hashing
 _MASK_KEYS = {"sysName", "sysDesc", "mgmtIp", "chassisIdV", "portIdV", "devId", "ip", "addr", "mac",
               "descr", "nameAlias", "annotation", "serial", "oobMgmtAddr", "inbMgmtAddr", "pwd"}
@@ -84,12 +86,34 @@ def _get(s, base, path, timeout):
     return r.json(), time.time() - t0, len(r.content)
 
 
-def _hash(imdata):
+def _hash(imdata, ignore=_VOLATILE):
     def clean(o):
         if isinstance(o, dict):
-            return {k: clean(v) for k, v in sorted(o.items()) if k not in _VOLATILE}
+            return {k: clean(v) for k, v in sorted(o.items()) if k not in ignore}
         return [clean(i) for i in o] if isinstance(o, list) else o
     return hashlib.sha256(json.dumps(clean(imdata), sort_keys=True).encode()).hexdigest()
+
+
+def _flat(objs, parent, out):
+    for o in objs:
+        for cls, body in o.items():
+            attrs = body.get("attributes", {})
+            dn = attrs.get("dn") or (parent or "") + "/" + attrs.get("rn", "")
+            out[dn] = (cls, attrs)
+            _flat(body.get("children", []), dn, out)
+    return out
+
+
+def _diff(a, b, ignore=_VOLATILE, top=12):
+    """Which attributes changed between two pulls of the same query (for an unstable hash)."""
+    fa, fb = _flat(a, None, {}), _flat(b, None, {})
+    n = collections.Counter()
+    for dn in fa.keys() & fb.keys():
+        for k in set(fa[dn][1]) | set(fb[dn][1]):
+            if k not in ignore and fa[dn][1].get(k) != fb[dn][1].get(k):
+                n[f"{fa[dn][0]}.{k}"] += 1
+    extra = len(fa.keys() ^ fb.keys())
+    return ", ".join(f"{k}({v})" for k, v in n.most_common(top)) + (f"; {extra} object(s) only in one pull" if extra else "")
 
 
 def _walk(objs, stats, depth=0):
@@ -124,53 +148,101 @@ def _shape(imdata):
                 "samples": [_mask(a) for a in s["samples"]]} for c, s in sorted(stats.items())}
 
 
+MAX_ITEM = 20_000_000  # characters of packed payload per write-queue item
+
+
 def _queue_store(site_id, pulls):
     import write_queue
     import aci_db  # noqa: F401  (registers the ACI queue actions)
     return write_queue.queue_and_wait("aci_save_raw_pull", timeout=600, site_id=site_id, pulls=pulls)
 
 
+def _chunks(packed):
+    cur, size = [], 0
+    for p in packed:
+        if cur and size + len(p["payload"]) > MAX_ITEM:
+            yield cur
+            cur, size = [], 0
+        cur.append(p)
+        size += len(p["payload"])
+    if cur:
+        yield cur
+
+
+def _roots(s, base, cfg, timeout, say):
+    """DNs of the objects directly under uni: from settings (config_roots) or asked from the APIC."""
+    if cfg["config_roots"]:
+        return list(cfg["config_roots"])
+    data, _, _ = _get(s, base, cfg["config_children_query"], timeout)
+    dns = [a["dn"] for o in data.get("imdata", []) for b in o.values() for a in [b.get("attributes", {})] if a.get("dn")]
+    say(f"{len(dns)} object(s) under uni")
+    return sorted(dns)
+
+
 def probe_site(octet, apics, user, password, cfg=None, say=print, site_id=None, store=_queue_store):
-    """Pull the whole config + operational classes from one site; store the raw pull (if site_id
-    is given) and write the shape report. store(site_id, pulls) is replaceable for tests."""
+    """Pull the config and operational classes from one site; store them (if site_id is given)
+    and write the shape report. store(site_id, pulls) is replaceable for tests."""
+    import aci_db
     cfg = cfg or _cfg()
     timeout = cfg["timeout_seconds"]
+    ignore = _VOLATILE | set(cfg["hash_ignore"])
     out_dir = settings_loader.resolve_path(cfg["probe_output_dir"])
     os.makedirs(out_dir, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     s, base = connect(apics, user, password, cfg, say)
-    report = {"probe_version": VERSION, "site": octet, "apic": "(masked)",
-              "queries": {}, "created": stamp}
+    report = {"probe_version": VERSION, "site": octet, "apic": "(masked)", "queries": {}, "created": stamp}
+    # (stored name, path, fallback path, report label)
+    plan = [("uni", "/api/mo/uni.json", None, "uni")]
+    try:
+        roots = _roots(s, base, cfg, timeout, say)
+    except Exception as e:
+        say(f"cannot list the objects under uni: {type(e).__name__}: {e} (set aci.config_roots to list them by hand)")
+        roots = []
+    for i, dn in enumerate(roots):
+        fb = f"/api/mo/{dn}.json?{cfg['config_fallback_options']}" if cfg["config_fallback_options"] else None
+        plan.append((dn, f"/api/mo/{dn}.json?{cfg['config_options']}", fb, f"root{i}"))
+    plan += [(c, f"/api/class/{c}.json", None, c) for c in cfg["operational_classes"]]
     packed = []
-    queries = {"uni": cfg["config_query"]}
-    queries.update({c: f"/api/class/{c}.json" for c in cfg["operational_classes"]})
-    for name, path in queries.items():
-        say(f"pulling {name}")
+    for name, path, fb, label in plan:
+        say(f"pulling {label if label.startswith('root') else name}")
         try:
-            data, secs, size = _get(s, base, path, timeout)
+            try:
+                data, secs, size = _get(s, base, path, timeout)
+                mode = "full"
+            except Exception as e:
+                if not fb:
+                    raise
+                say(f"{label}: {type(e).__name__}: {e} - retrying with {cfg['config_fallback_options']}")
+                data, secs, size = _get(s, base, fb, timeout)
+                mode = "fallback"
             imdata = data.get("imdata", [])
-            import aci_db
-            packed.append({"query": name, "hash": _hash(imdata), "payload": aci_db.pack(imdata), "size": size})
-            q = {"seconds": round(secs, 1), "bytes": size, "objects_top": len(imdata), "hash": _hash(imdata)}
-            say(f"pulled {name}: {len(imdata)} top object(s), {size / 1e6:.1f} MB, {secs:.1f}s")
-            if name == "uni":
-                q["top_level_children"] = sorted({c for o in imdata for b in o.values()
-                                                  for k in b.get("children", []) for c in k})
-                if cfg["probe_repeat"]:
-                    say("pulling uni again (hash stability)")
-                    again, _, _ = _get(s, base, path, timeout)
-                    q["hash_stable_between_pulls"] = _hash(again.get("imdata", [])) == q["hash"]
+            packed.append({"query": name, "hash": _hash(imdata, ignore), "payload": aci_db.pack(imdata), "size": size})
+            q = {"seconds": round(secs, 1), "bytes": size, "objects_top": len(imdata), "mode": mode, "hash": packed[-1]["hash"]}
+            say(f"pulled {label}: {len(imdata)} top object(s), {size / 1e6:.1f} MB, {secs:.1f}s" + (" (config-only fallback)" if mode == "fallback" else ""))
+            if label == "root0" and cfg["probe_repeat"]:
+                say(f"pulling {label} again (hash stability)")
+                again, _, _ = _get(s, base, fb if mode == "fallback" else path, timeout)
+                same = _hash(again.get("imdata", []), ignore) == q["hash"]
+                q["hash_stable_between_pulls"] = same
+                if not same:
+                    q["changed_attributes"] = _diff(imdata, again.get("imdata", []), ignore)
+                    say(f"HASH NOT STABLE for {label}; changing attributes: {q['changed_attributes']} "
+                        "(add names to aci.hash_ignore)")
             q["shape"] = _shape(imdata)
-            report["queries"][name] = q
+            report["queries"][label] = q
         except Exception as e:  # one failed query must not lose the others
-            report["queries"][name] = {"error": f"{type(e).__name__}: {e}"}
-            say(f"query {name} failed: {type(e).__name__}: {e}")
+            report["queries"][label] = {"error": f"{type(e).__name__}: {e}"}
+            say(f"query {label} failed: {type(e).__name__}: {e}")
             if cfg.get("debug"):
                 import traceback
                 say(traceback.format_exc())
     if site_id is not None and packed:
-        res = store(site_id, packed)
-        say(f"stored raw pull: {res}")
+        names = [p[0] for p in plan]  # the queries of this run, failed ones included
+        packed.append({"query": "_run", "hash": _hash(names), "payload": aci_db.pack(names), "size": len(names)})
+        total = collections.Counter()
+        for chunk in _chunks(packed):
+            total.update(store(site_id, chunk))
+        say(f"stored raw pull: {dict(total)}")
     rep_path = os.path.join(out_dir, f"shape_report_{octet}_{stamp}.json")
     with open(rep_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=1)
@@ -193,19 +265,19 @@ def _selftest():
     import tempfile
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
-    uni = {"imdata": [{"polUni": {"attributes": {"dn": "uni"}, "children": [
-        {"infraInfra": {"attributes": {"dn": "uni/infra", "modTs": "1"}, "children": [
-            {"infraAccPortGrp": {"attributes": {"dn": "uni/infra/funcprof/accportgrp-x", "name": "x",
-                                                 "descr": "host 10.1.2.3 aa:bb:cc:dd:ee:ff"}}}]}},
-        {"fvTenant": {"attributes": {"dn": "uni/tn-a", "name": "a"}}}]}}]}
+    infra = {"imdata": [{"infraInfra": {"attributes": {"dn": "uni/infra", "modTs": "1"}, "children": [
+        {"infraAccPortGrp": {"attributes": {"rn": "funcprof/accportgrp-x", "name": "x",
+                                             "descr": "host 10.1.2.3 aa:bb:cc:dd:ee:ff"}}}]}}]}
+    tenant = {"imdata": [{"fvTenant": {"attributes": {"dn": "uni/tn-a", "name": "a"}}}]}
+    children = {"imdata": [{"infraInfra": {"attributes": {"dn": "uni/infra"}}}, {"fvTenant": {"attributes": {"dn": "uni/tn-a"}}}]}
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
-        def _send(self, obj):
+        def _send(self, obj, code=200):
             b = json.dumps(obj).encode()
-            self.send_response(200)
+            self.send_response(code)
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
             self.wfile.write(b)
@@ -215,8 +287,16 @@ def _selftest():
             self._send({"imdata": []})
 
         def do_GET(self):
-            if self.path.startswith("/api/mo/uni"):
-                return self._send(uni)
+            if "query-target=children" in self.path:
+                return self._send(children)
+            if self.path.startswith("/api/mo/uni/infra"):
+                return self._send(infra)
+            if self.path.startswith("/api/mo/uni/tn-a"):  # refuses all properties, accepts config-only
+                if "prop-include=all" in self.path:
+                    return self._send({"imdata": [{"error": {"attributes": {"text": "rsp-subtree not supported"}}}]}, 400)
+                return self._send(tenant)
+            if self.path.startswith("/api/mo/uni.json"):
+                return self._send({"imdata": [{"polUni": {"attributes": {"dn": "uni"}}}]})
             if "lldpAdjEp" in self.path:
                 return self._send({"imdata": [{"lldpAdjEp": {"attributes": {"sysName": "host1", "mgmtIp": "10.9.9.9"}}}]})
             self.send_error(500)
@@ -230,15 +310,24 @@ def _selftest():
     cfg = dict(settings_loader.DEFAULTS["aci"], verify=True, probe_repeat=True,
                probe_output_dir=tempfile.mkdtemp(), operational_classes=["lldpAdjEp", "fabricNode"])
     msgs = []
+    stored = []
     rep = probe_site("t", [f"http://127.0.0.1:{dead_port}", f"http://127.0.0.1:{srv.server_port}"],
-                     "u", "p", cfg, msgs.append)
+                     "u", "p", cfg, msgs.append, site_id=1, store=lambda sid, pulls: stored.extend(pulls) or {"stored": len(pulls)})
     r = json.load(open(rep))
     assert any("trying next" in m for m in msgs), "failover not used"
     q = r["queries"]
-    assert q["uni"]["hash_stable_between_pulls"] and q["uni"]["shape"]["infraAccPortGrp"]["count"] == 1
+    assert q["root0"]["hash_stable_between_pulls"] and q["root0"]["shape"]["infraAccPortGrp"]["count"] == 1
+    assert q["root1"]["mode"] == "fallback" and any("retrying" in m for m in msgs), "fallback not used"
     assert "error" in q["fabricNode"] and q["lldpAdjEp"]["shape"]["lldpAdjEp"]["samples"][0]["sysName"] == "***"
     assert "10.1.2.3" not in json.dumps(r) and "aa:bb" not in json.dumps(r)
-    assert q["uni"]["top_level_children"] == ["fvTenant", "infraInfra"]
+    import aci_db
+    assert [p["query"] for p in stored][-1] == "_run"
+    assert aci_db.unpack([p for p in stored if p["query"] == "_run"][0]["payload"]) == \
+        ["uni", "uni/infra", "uni/tn-a", "lldpAdjEp", "fabricNode"]
+    a1 = [{"fvTenant": {"attributes": {"dn": "uni/tn-a", "pkts": "1", "modTs": "1"}}}]
+    a2 = [{"fvTenant": {"attributes": {"dn": "uni/tn-a", "pkts": "2", "modTs": "2"}}}]
+    assert _hash(a1) != _hash(a2) and _hash(a1, _VOLATILE | {"pkts"}) == _hash(a2, _VOLATILE | {"pkts"})
+    assert _diff(a1, a2) == "fvTenant.pkts(1)"
     try:
         connect([f"http://127.0.0.1:{dead_port}"], "u", "p", cfg, msgs.append)
         raise AssertionError("expected ConnectionError")

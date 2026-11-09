@@ -115,8 +115,13 @@ def latest_pulls(conn, site_id: int):
                              (SELECT MAX(id) FROM aci_raw WHERE site_id=? GROUP BY query)""", (site_id,)):
         pulls[r[0]] = json.loads(zlib.decompress(r[3]))
         when[r[0]] = r[1]
-        sig.append(r[2][:12])
-    return pulls, when, "".join(sorted(sig))
+        sig.append((r[0], r[2][:12]))
+    run = pulls.pop("_run", None)  # the queries of the newest run; older query names are ignored
+    if run is not None:
+        pulls = {k: v for k, v in pulls.items() if k in run}
+        when = {k: v for k, v in when.items() if k in run}
+        sig = [x for x in sig if x[0] in run]
+    return pulls, when, "".join(sorted(h for _, h in sig))
 
 
 def overlay(conn, site_id: int):

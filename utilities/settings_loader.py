@@ -38,7 +38,14 @@ DEFAULTS = {
         "login_domain": "",
         "verify": False,  # False | True | "path/to/ca.pem". False prints one warning per run.
         "timeout_seconds": 600,
-        "config_query": "/api/mo/uni.json?rsp-subtree=full&rsp-prop-include=config-only",
+        # The config is pulled per object under uni (the APIC refuses rsp-subtree on uni itself with all
+        # properties). config_roots: DNs to pull; empty = ask the APIC for the children of uni.
+        "config_roots": [],
+        "config_children_query": "/api/mo/uni.json?query-target=children",
+        "config_options": "rsp-subtree=full&rsp-prop-include=all",
+        # Used for a root the APIC refuses with config_options ("" = no fallback, the root fails).
+        "config_fallback_options": "rsp-subtree=full&rsp-prop-include=config-only",
+        "hash_ignore": [],  # attribute names to leave out of the change hash (runtime counters etc.)
         "operational_classes": ["fabricNode", "fabricExplicitGEp", "fabricPathEp", "lldpAdjEp", "cdpAdjEp"],
         "probe_output_dir": "aci_probe_output",
         "probe_repeat": True,  # pull uni twice to check the hash is stable

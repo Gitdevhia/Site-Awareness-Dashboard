@@ -30,7 +30,8 @@ Core rule: the collector and parsers never decide what the UI can show. Raw data
 
 ## 4. Collection plan
 
-- **Config: one whole query**, `GET /api/mo/uni.json?rsp-subtree=full&rsp-prop-include=config-only`. It returns the entire policy configuration (access policies, physical/L2/L3/VMM domains, tenants, fabric policies) with no list of roots to maintain. No fallback is built in; if the APIC refuses or times out, the plan is adjusted then (likely by splitting per top-level child of `uni`).
+- **Config: per-object pull with all properties.** The APIC refuses `rsp-subtree` on `uni` itself with `rsp-prop-include=all` ("not supported for class polUni"), while `config-only` on `uni` works but leaves out computed values (for example `tDn` on name-based relations like `fvRsBd`). So the collector pulls `uni` alone, lists the children of `uni` (`query-target=children`), and pulls each child (access policies, every tenant, fabric, domains...) with `rsp-subtree=full&rsp-prop-include=all`. A child the APIC refuses is retried with `config_fallback_options` (config-only) and marked `fallback` in the report. Settings: `config_roots`, `config_children_query`, `config_options`, `config_fallback_options`, `hash_ignore`.
+- **Hash stability:** all-properties data carries runtime values. `modTs`-style fields are ignored when hashing; if the first root differs between two pulls the run prints which attributes changed, to add to `hash_ignore`.
 - **Operational allowlist** (in settings; not under `uni`): `fabricNode`, `fabricExplicitGEp` (vPC pairs), path objects, `lldpAdjEp`, `cdpAdjEp`.
 - **Endpoints** (phase 3): paged `fvCEp` with children (`fvIp`, `fvRsCEpToPathEp`). Parsed into their own table, raw optional.
 - **Site to APIC mapping** is in settings, keyed by site octet. Sites with no APIC entry are skipped with a "skipped" status.
@@ -109,3 +110,4 @@ DNS scope (endpoint IPs only or LLDP/CDP names too), where endpoint search lives
 - Overrides and anchors are applied when pages are generated; there is no editor yet (phase 2 tab). Until then use the queue actions.
 - Purge: `aci_db.purge_raw(conn, "YYYY-MM-DD")` keeps each query's first and newest pull.
 - Output and debugging: each query prints `pulled <name>: N top object(s), X MB, Ts`; failures print `Type: message`. Set `aci.debug` to `true` in `settings.json` to also print a full traceback for a failed query. `python utilities/aci_collect.py --selftest` checks a hand-copied file against a fake APIC (run it with the same Python used for the orchestrator).
+- Config pull (option 2, built): queries are stored per root DN; a `_run` row lists the queries of each run and readers ignore older query names. Pulls are sent to the queue in items of at most about 20 MB. The stored data is the full all-properties config, not a filtered copy.
